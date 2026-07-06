@@ -1,0 +1,64 @@
+# docker/docker-compose.scratch.yml
+#
+# Scratch Postgres (with the postgresql_anonymizer `anon` extension) plus an
+# Odoo 19 instance with demo data, for local development and testing.
+#
+#   docker compose -f docker/docker-compose.scratch.yml up -d
+#
+# The postgres-anon service auto-installs `anon`, initializes its faker
+# dictionary, and loads the odoo_synth helper functions from
+# ../sql/bootstrap.sql on first init (via docker-entrypoint-initdb.d).
+# Both SQL files are mounted read-only into the init dir and run in
+# alphabetical order: 01-init-anon.sql first (CREATE EXTENSION + init),
+# then 02-bootstrap.sql (odoo_synth schema + functions, which reference
+# anon.*).
+#
+# Images are pinned to specific tags -- do not float :latest in production
+# tooling. anon version is recorded in a comment at the top of
+# sql/bootstrap.sql.
+
+services:
+  postgres-anon:
+    image: registry.gitlab.com/dalibo/postgresql_anonymizer:3.1.3
+    container_name: odoo-synth-postgres-anon
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-odoo_synth}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-odoo_synth}
+      POSTGRES_DB: ${POSTGRES_DB:-scratch}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      # Auto-run on first init only (empty data dir). Ordered by filename.
+      - ./01-init-anon.sql:/docker-entrypoint-initdb.d/01-init-anon.sql:ro
+      - ../sql/bootstrap.sql:/docker-entrypoint-initdb.d/02-bootstrap.sql:ro
+      - postgres-anon-data:/var/lib/postgresql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-odoo_synth} -d ${POSTGRES_DB:-scratch}"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  odoo:
+    image: odoo:19.0-20260630
+    container_name: odoo-synth-odoo
+    depends_on:
+      postgres-anon:
+        condition: service_healthy
+    # --without-demo=False means demo data IS loaded (the default). Kept
+    # explicit so the intent is unambiguous: this instance exists to give
+    # the tool realistic data to mask during integration tests.
+    command: odoo --without-demo=False --db_host=postgres-anon --db_user=${POSTGRES_USER:-odoo_synth} --db_password=${POSTGRES_PASSWORD:-odoo_synth} -d ${ODOO_DB:-odoo}
+    environment:
+      HOST: postgres-anon
+      USER: ${POSTGRES_USER:-odoo_synth}
+      PASSWORD: ${POSTGRES_PASSWORD:-odoo_synth}
+    ports:
+      - "${ODOO_PORT:-8069}:8069"
+    volumes:
+      - odoo-web-data:/var/lib/odoo
+      - odoo-config:/etc/odoo
+
+volumes:
+  postgres-anon-data:
+  odoo-web-data:
+  odoo-config:

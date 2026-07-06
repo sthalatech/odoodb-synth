@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+
+# Docker (keep .env.example, ignore real .env)
+docker/.env
+
+# OS/editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

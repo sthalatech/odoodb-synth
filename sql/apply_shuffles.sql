@@ -1,0 +1,33 @@
+-- sql/apply_shuffles.sql
+--
+-- Handles the `shuffle_within_column` strategy separately from the
+-- per-column SECURITY LABEL approach in mask.py, because it operates
+-- across rows rather than per-value.
+--
+-- The `shuffle_within_column` strategy in rules/00_strategies.yml has
+-- sql_template: null -- it cannot be expressed as a per-column masking
+-- function, so the rulebook leaves the SQL to this file.
+--
+-- anon.shuffle_column(shuffle_table regclass, shuffle_column name,
+--                    primary_key name) rewrites the named column in place
+-- so that the set of values is preserved exactly but each row gets a
+-- different row's value. This preserves the value distribution (useful
+-- for dashboards/reports that need realistic aggregate numbers) while
+-- breaking row-level correlation.
+--
+-- USAGE: this file is intended to be run AFTER anon.anonymize_database()
+-- has applied the per-column SECURITY LABEL rules, against the scratch
+-- (never source) database. The actual table/column/PK triples to shuffle
+-- are read from the loaded rulebook at runtime by mask.py, which emits
+-- one `SELECT anon.shuffle_column(...)` call per declared shuffle. This
+-- file documents the mechanism; mask.py generates the concrete statements.
+--
+-- Guardrail: never run this against the source database. mask.py only
+-- ever connects to a scratch DB restored from the source dump.
+--
+-- Reference (anon 3.1.3):
+--   anon.shuffle_column(shuffle_table regclass, shuffle_column name,
+--                       primary_key name) returns boolean
+
+-- Example (do not run blindly -- generated per-rulebook at runtime):
+-- SELECT anon.shuffle_column('res_partner'::regclass, 'some_column', 'id');
