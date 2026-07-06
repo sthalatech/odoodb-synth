@@ -1,0 +1,60 @@
+# rules/30_hr.yml
+# Employees, contracts, recruitment, leave.
+#
+# This is the single highest-risk file in the rulebook. HR data
+# routinely includes special-category data under GDPR (health info via
+# leave reasons, national ID numbers) and, in the case of
+# hr.applicant, data belonging to people who were never even hired —
+# rejected candidates who have no relationship with whoever ends up
+# debugging this dev copy. Default posture throughout: aggressive.
+
+hr.employee:
+  fields:
+    name:                   { strategy: fake_person_name, note: "Keep consistent with the linked res.partner (work_contact_id / address_home_id) where one exists — same seed value produces the same fake name." }
+    work_email:               { strategy: fake_email }
+    work_phone:               { strategy: fake_phone }
+    mobile_phone:             { strategy: fake_phone }
+    private_email:            { strategy: fake_email }
+    private_phone:            { strategy: fake_phone }
+    identification_id:        { strategy: drop, note: "National ID / SSN-equivalent. No debugging scenario needs the real value." }
+    passport_id:              { strategy: drop }
+    permit_no:                { strategy: drop }
+    visa_no:                  { strategy: drop }
+    emergency_contact:         { strategy: drop }
+    emergency_phone:           { strategy: drop }
+    birthday:                 { strategy: generalize_year }
+    gender:                    { strategy: keep, note: "Low individual risk in isolation; review if your workforce is small enough that demographic fields become re-identifying in combination." }
+    marital:                   { strategy: keep, same_note_as: gender }
+    children:                  { strategy: keep }
+    study_field:                { strategy: keep }
+    certificate:                { strategy: keep }
+    image_1920:                 { strategy: null_binary }
+    barcode:                    { strategy: partial_keep_last4 }
+    pin:                        { strategy: rotate_secret, note: "Attendance/kiosk PIN — rotate to a fixed dev default rather than deriving from the original." }
+    km_home_work:                { strategy: generalize_numeric_band }
+    notes:                       { strategy: redact_freetext }
+
+hr.contract:
+  fields:
+    wage:                       { strategy: generalize_numeric_band }
+    net_wage:                    { strategy: generalize_numeric_band }
+    # other provider/localization-specific pay fields (commission,
+    # benefits amounts) should follow the same generalize_numeric_band
+    # treatment — extend per the payroll localization modules you run.
+
+hr.applicant:
+  fields:
+    partner_name:                { strategy: fake_person_name }
+    email_from:                  { strategy: fake_email }
+    partner_phone:                { strategy: fake_phone }
+    salary_expected:               { strategy: generalize_numeric_band }
+    salary_proposed:               { strategy: generalize_numeric_band }
+    description:                    { strategy: redact_freetext, note: "Interviewer notes on a candidate. Treat as sensitive by default — this is commentary about a real person's job interview." }
+    # CV/resume attachments on this model: see 50_attachments.yml —
+    # hr.applicant is in the always-full-scrub list (content AND
+    # filename), no exceptions. There is no legitimate debugging need
+    # to see a real rejected candidate's actual resume.
+
+hr.leave:
+  fields:
+    name:                          { strategy: redact_freetext, note: "This is the leave-request reason field. It routinely contains health information ('chemo appointment', 'maternity', 'therapy') — this is special-category data under GDPR, not ordinary PII. Do not downgrade this rule without specifically thinking through why." }

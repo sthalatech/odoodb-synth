@@ -1,0 +1,29 @@
+# rules/50_attachments.yml
+# ir.attachment doesn't get per-field rules like everything else — the
+# risk lives in the binary content and, for some models, in the
+# filename itself. Policy is keyed on the *parent record's model*
+# (ir.attachment.res_model), not on ir.attachment's own fields.
+
+default_policy:
+  content:       drop        # filestore blob is never carried over, full stop
+  filename:      keep        # ir.attachment.name — kept by default, useful for UI/layout debugging ("this record has 3 PDFs attached")
+  mimetype:      keep
+  file_size:     keep
+  checksum:      drop        # recompute on next access; stale checksum against dropped content is meaningless anyway
+  index_content: drop        # ir.attachment stores extracted full-text search content separately — this is a second copy of the document's content and needs dropping in lockstep with the blob itself
+
+# Models where even the FILENAME gets scrubbed, because the filename
+# itself routinely contains PII (people name their own uploads).
+# Replaced with attachment_<id>.<original-extension>.
+full_scrub_filename_for_models:
+  - hr.applicant       # "John_Smith_Resume_SSN_last4_1234.pdf" is a real pattern people use
+  - hr.employee        # ID/passport scans, signed contracts
+  - hr.contract
+  - res.partner        # KYC/ID documents if your industry collects them here
+
+# Models excluded from attachments entirely — not even the row survives.
+# Use sparingly; this breaks "this record has N attachments" UI counts
+# for these models specifically. Uncomment if that tradeoff is worth it
+# for your instance (e.g. an industry with unusually sensitive uploads).
+# exclude_rows_entirely_for_models:
+#   - hr.applicant

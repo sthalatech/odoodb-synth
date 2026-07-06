@@ -1,0 +1,65 @@
+# rules/40_messaging.yml
+# Chatter, mail, activities, calendar.
+#
+# READ THIS FILE'S mail.tracking.value SECTION BEFORE SKIPPING IT.
+# It's the single most commonly missed leak in every hand-rolled Odoo
+# anonymization script we could find prior art for. Masking
+# res.partner.email going forward does nothing about the *audit trail*
+# of that field's history sitting in chatter.
+
+mail.message:
+  fields:
+    body:                    { strategy: redact_freetext, note: "Chatter body. Free text typed by real support/sales staff about real customers — assume it contains PII until proven otherwise for your instance." }
+    subject:                  { strategy: redact_freetext, note: "Cheap to redact, and subjects do leak specifics ('Re: John's billing complaint'). Downgrade to keep only if you've specifically reviewed your subject-line conventions." }
+    email_from:                 { strategy: fake_email, note: "Raw From: header, captured before/instead of partner resolution — can carry an external address that never made it into res.partner at all." }
+    record_name:                { strategy: drop, note: "Denormalized display name of the parent record — often just re-leaks whatever the parent's masked name field was trying to hide. Safe to drop; Odoo recomputes it on next reference." }
+
+mail.mail:
+  fields:
+    email_to:                   { strategy: fake_email }
+    email_cc:                    { strategy: fake_email }
+    email_bcc:                    { strategy: fake_email }
+    reply_to:                     { strategy: fake_email }
+    headers:                       { strategy: drop, note: "Raw email headers can carry routing IPs and internal server hostnames alongside recipient data." }
+    body_html:                     { strategy: redact_freetext }
+
+mail.tracking.value:
+  fields:
+    old_value_char:                 { strategy: drop }
+    new_value_char:                  { strategy: drop }
+    old_value_text:                   { strategy: drop }
+    new_value_text:                    { strategy: drop }
+  note: >
+    THE GOTCHA: every time a tracked field changes (email, phone,
+    address — anything with tracking=True on the field definition),
+    Odoo writes the OLD and NEW literal values into this table to
+    render "Email changed from X to Y" in chatter. This happens
+    completely independently of whatever masking rule you wrote for
+    res.partner.email. If you mask the live column but skip this
+    table, the real historical value is still sitting in the DB,
+    fully visible in every affected record's chatter. Drop the value
+    columns wholesale rather than trying to selectively re-derive
+    them — there's no reliable way to know which historical value
+    corresponds to which masked-forward value without redoing the
+    entire masking pass against history.
+
+mail.activity:
+  fields:
+    note:                    { strategy: redact_freetext }
+    summary:                  { strategy: keep, note: "Usually a short task label ('Follow up call') rather than content — review for your instance's conventions." }
+
+calendar.event:
+  fields:
+    name:                     { strategy: keep, note: "Meeting title. Flip to redact_freetext if your org's meeting titles tend to name clients/topics directly." }
+    description:               { strategy: redact_freetext }
+    location:                  { strategy: redact_freetext, note: "Can be a home address for remote/WFH meetings, not just an office." }
+    # attendee emails resolve through res.partner / mail.mail masking
+    # already covered above.
+
+discuss.channel:
+  note: >
+    Channel messages are ordinary mail.message rows with
+    model='discuss.channel' — covered by the mail.message rules above,
+    no separate handling needed. Channel *names* and member lists are
+    left alone by default; review if your channels are named after
+    real clients.

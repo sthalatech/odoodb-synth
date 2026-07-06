@@ -1,0 +1,47 @@
+# rules/70_sales_crm_website.yml
+# Leads, orders, newsletter/marketing lists, surveys.
+
+crm.lead:
+  fields:
+    contact_name:              { strategy: fake_person_name }
+    partner_name:                { strategy: fake_company_name }
+    email_from:                   { strategy: fake_email }
+    phone:                         { strategy: fake_phone }
+    mobile:                         { strategy: fake_phone }
+    street:                          { strategy: fake_street_address }
+    city:                             { strategy: fake_city }
+    zip:                               { strategy: fake_zip }
+    description:                       { strategy: redact_freetext, note: "Free-form deal notes — this is exactly where a salesperson pastes a client's personal circumstances." }
+
+sale.order:
+  fields:
+    client_order_ref:                    { strategy: keep, note: "Usually the customer's own PO number, not PII in itself — review your instance's convention." }
+    note:                                 { strategy: redact_freetext }
+    # partner_id / partner_shipping_id / partner_invoice_id resolve
+    # through the res.partner rules in 10_core.yml already.
+
+purchase.order:
+  fields:
+    notes:                                { strategy: redact_freetext }
+
+mailing.contact:
+  fields:
+    name:                                  { strategy: fake_person_name }
+    email:                                  { strategy: fake_email }
+    # opt_out and other boolean consent flags are left untouched —
+    # they're the one thing on this model that's actively useful to
+    # keep realistic for testing unsubscribe/consent logic.
+
+mailing.mailing:
+  fields:
+    body_html:                              { strategy: redact_freetext, note: "Marketing email body — often includes real names via mail-merge placeholders resolved at send time; the template itself is usually fine, review before downgrading this." }
+
+survey.user_input_line:
+  fields:
+    value_char_box:                          { strategy: redact_freetext }
+    value_text_box:                            { strategy: redact_freetext, note: "Depending on the survey's purpose (exit interviews, health screenings, satisfaction with a named support rep) this can be special-category data. Same posture as hr.leave.name — don't downgrade without specifically reviewing what your surveys actually ask." }
+
+website.visitor:
+  fields:
+    partner_id:                                 { strategy: keep, note: "Resolves through res.partner masking already; the link itself isn't sensitive." }
+    # ip/geo fields, if present in your version: see 60_system_secrets.yml

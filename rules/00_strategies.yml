@@ -1,0 +1,130 @@
+# rules/00_strategies.yml
+#
+# Defines the masking-strategy vocabulary used by every other rulebook
+# file. Every other file just assigns one of these names to a field —
+# the actual SQL lives here, once.
+#
+# DETERMINISM: fake_* strategies use setseed() on a hash of the source
+# value, then call the underlying anon.fake_*() function. This means
+# the same real value always produces the same fake value — the same
+# customer's email looks identical wherever it's referenced (res.partner,
+# mail.message.email_from, account.move, ...), which keeps joins,
+# dedup logic, and "search for this record" workflows behaving
+# realistically. Newer `anon` versions may expose dedicated pseudo_*
+# helpers that do this natively — check your installed version's docs;
+# if they exist, prefer them over the setseed() wrapper below.
+#
+# All odoo_synth.* functions referenced here are installed by
+# `odoo-synth bootstrap` into a dedicated `odoo_synth` schema — see
+# sql/bootstrap.sql in the repo root.
+
+strategies:
+
+  drop:
+    description: >
+      Set to NULL. For anything with no legitimate debugging reason to
+      survive into a dev copy: raw secrets, tokens, real passwords.
+    sql_template: "MASKED WITH VALUE NULL"
+
+  keep:
+    description: >
+      Explicit no-op. Marks a field as reviewed and confirmed
+      non-sensitive, so `rules scan` stops flagging it as undeclared.
+    sql_template: null
+
+  fake_person_name:
+    description: "Deterministic fake human name."
+    sql_template: >
+      MASKED WITH FUNCTION odoo_synth.seeded(
+        {column}, 'anon.fake_first_name() || '' '' || anon.fake_last_name()'
+      )
+
+  fake_company_name:
+    description: "Deterministic fake company/organization name."
+    sql_template: "MASKED WITH FUNCTION odoo_synth.seeded({column}, 'anon.fake_company()')"
+
+  fake_email:
+    description: >
+      Deterministic, syntactically valid fake email. Domain is faked
+      too — never leaks the real customer's company domain.
+    sql_template: "MASKED WITH FUNCTION odoo_synth.fake_email({column})"
+
+  fake_phone:
+    description: "Deterministic fake phone number, plausible format (not locale-validated)."
+    sql_template: "MASKED WITH FUNCTION odoo_synth.seeded({column}, 'anon.fake_phone_number()')"
+
+  fake_street_address:
+    sql_template: "MASKED WITH FUNCTION odoo_synth.seeded({column}, 'anon.fake_address()')"
+
+  fake_city:
+    sql_template: "MASKED WITH FUNCTION odoo_synth.seeded({column}, 'anon.fake_city()')"
+
+  fake_zip:
+    sql_template: "MASKED WITH FUNCTION odoo_synth.seeded({column}, 'anon.fake_postcode()')"
+
+  fake_vat:
+    description: >
+      Format-preserving fake VAT/tax ID — keeps country prefix and
+      digit count so Odoo's built-in VAT validation doesn't reject it
+      on load, but the number itself is fake. Checksum-valid where the
+      country's VAT format has one (best-effort, extend per country).
+    sql_template: "MASKED WITH FUNCTION odoo_synth.fake_vat({column})"
+
+  fake_iban:
+    description: >
+      Format-preserving fake IBAN — real country code and length, fake
+      account digits, mod-97 checksum recalculated so it still passes
+      Odoo's IBAN validator.
+    sql_template: "MASKED WITH FUNCTION odoo_synth.fake_iban({column})"
+
+  fake_bank_account_number:
+    sql_template: "MASKED WITH FUNCTION odoo_synth.fake_bank_account({column})"
+
+  partial_keep_last4:
+    description: >
+      Keeps the last 4 characters, masks the rest. For reference
+      numbers a developer might search on while debugging (invoice
+      refs, ticket numbers) where the full value isn't needed.
+    sql_template: "MASKED WITH FUNCTION anon.partial({column}, 0, '****', 4)"
+
+  generalize_year:
+    description: >
+      Collapses a date to Jan 1 of the same year. Keeps rough
+      age/tenure math working without exposing an exact birthdate.
+    sql_template: "MASKED WITH FUNCTION date_trunc('year', {column})"
+
+  generalize_numeric_band:
+    description: >
+      Adds proportional noise to a sensitive number (salary, credit
+      limit). Preserves "this is roughly senior-level" without
+      exposing the exact figure.
+    sql_template: "MASKED WITH FUNCTION anon.noise({column}, 0.15)"
+
+  shuffle_within_column:
+    description: >
+      Shuffles real values across rows in the same column. Preserves
+      the exact value distribution (useful if dashboards/reports need
+      realistic aggregate numbers) while breaking row-level
+      correlation. Applied via anon.shuffle_column(), not a per-column
+      label — see sql/apply_shuffles.sql.
+    sql_template: null
+
+  redact_freetext:
+    description: >
+      Replaces free-text content with placeholder text of similar
+      length. See README.md's "free-text problem" section before
+      assuming this is a complete solution.
+    sql_template: "MASKED WITH FUNCTION odoo_synth.redact_text({column})"
+
+  null_binary:
+    description: "Drops binary content. Row/metadata policy is separate — see 50_attachments.yml."
+    sql_template: "MASKED WITH VALUE NULL"
+
+  rotate_secret:
+    description: >
+      NOT a masking strategy in the pseudonymization sense — generates
+      a fresh, unrelated random value instead of anything derived from
+      the original. Used where "derived from the original" is itself a
+      risk (signing secrets, live API keys). See 60_system_secrets.yml
+      for the specific rotation logic per field.
+    sql_template: "custom, see 60_system_secrets.yml"

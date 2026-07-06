@@ -1,0 +1,67 @@
+# rules/10_core.yml
+# res.partner, res.users, res.company, bank accounts.
+# This is the file everything else refers back to — partner_id shows
+# up on nearly every other model, and deterministic masking here is
+# what keeps the rest of the database internally consistent.
+
+res.partner:
+  fields:
+    name:                { strategy: fake_person_name, note: "Applies to both companies and individuals; fake_company_name reads oddly on person records but is functionally harmless. Split on is_company if you want it cosmetically correct." }
+    email:                { strategy: fake_email }
+    phone:                { strategy: fake_phone }
+    mobile:               { strategy: fake_phone }
+    street:               { strategy: fake_street_address }
+    street2:              { strategy: drop }
+    city:                 { strategy: fake_city }
+    zip:                  { strategy: fake_zip }
+    state_id:             { strategy: keep, note: "Reference data (res.country.state), not PII." }
+    country_id:           { strategy: keep }
+    vat:                  { strategy: fake_vat }
+    company_registry:     { strategy: drop, note: "National company registry number — treat like a VAT-adjacent identifier." }
+    website:              { strategy: drop, note: "Real domain can identify the company; low value to keep for debugging." }
+    function:             { strategy: keep, note: "Job title. Low individual risk, but review — combined with name+company it can re-identify someone in a small org. Flip to drop if that's a concern for your data." }
+    comment:              { strategy: redact_freetext }
+    image_1920:           { strategy: null_binary }
+    image_1024:           { strategy: null_binary }
+    image_512:            { strategy: null_binary }
+    image_256:            { strategy: null_binary }
+    image_128:            { strategy: null_binary }
+    signup_token:         { strategy: drop }
+    signup_expiration:    { strategy: drop }
+    partner_latitude:     { strategy: drop, note: "Precise geocoordinates are direct-identifying PII, especially for individual contacts' home addresses." }
+    partner_longitude:    { strategy: drop }
+    barcode:              { strategy: partial_keep_last4 }
+    lang:                 { strategy: keep }
+    industry_id:          { strategy: keep }
+
+res.partner.bank:
+  fields:
+    acc_number:           { strategy: fake_iban, note: "Odoo stores both IBAN and non-IBAN account numbers in this field; fake_iban falls back to fake_bank_account_number logic for non-IBAN formats — check odoo_synth.fake_iban's fallback branch matches your locale mix." }
+    acc_holder_name:      { strategy: fake_person_name }
+    sanitized_acc_number: { strategy: drop, note: "Computed/stored digest of acc_number — must be dropped in lockstep with acc_number or it becomes the leak." }
+
+res.users:
+  fields:
+    login:                { strategy: fake_email, note: "Usually mirrors partner_id.email; masked independently here since login can diverge (SSO usernames, etc.)." }
+    password:             { strategy: drop, note: "Hashed already, but a dev DB is not where a real password hash — even bcrypt'd — should live." }
+    signature:            { strategy: redact_freetext, note: "HTML email signature block — routinely contains direct phone/address, sometimes a second email." }
+    totp_secret:          { strategy: drop, note: "This is someone's real 2FA seed. Never ships." }
+    api_key_ids:          { strategy: drop, note: "res.users.apikeys — stores a hash, but treat as a live credential, not data." }
+
+res.users.log:
+  fields:
+    create_date:          { strategy: keep }
+    ip:                   { strategy: drop, note: "Login IP history. PII under GDPR; also just not useful for debugging." }
+
+res.company:
+  fields:
+    name:                 { strategy: fake_company_name, note: "This is usually the customer's own company identity — arguably the single most sensitive value in the whole DB from a 'don't leak whose data this is' standpoint." }
+    email:                { strategy: fake_email }
+    phone:                { strategy: fake_phone }
+    street:               { strategy: fake_street_address }
+    city:                 { strategy: fake_city }
+    zip:                  { strategy: fake_zip }
+    vat:                  { strategy: fake_vat }
+    company_registry:     { strategy: drop }
+    website:              { strategy: drop }
+    logo:                 { strategy: null_binary }

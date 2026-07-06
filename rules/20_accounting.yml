@@ -1,0 +1,55 @@
+# rules/20_accounting.yml
+# Invoices, payments, and payment gateway integration.
+#
+# The payment.* models get the strictest treatment in this whole
+# rulebook. A masked *name* on a payment token doesn't neutralize the
+# token — if the token or provider reference survives, it may still be
+# a usable handle against a real, live payment gateway account. These
+# fields get dropped, not disguised.
+
+account.move:
+  fields:
+    ref:                  { strategy: redact_freetext, note: "Free-text customer reference — invoices routinely carry a customer's own PO number or a typed note here." }
+    narration:             { strategy: redact_freetext }
+    # partner_id, invoice line amounts, dates, numbering: left alone —
+    # not PII, and the numbers/dates are usually exactly what you want
+    # realistic for testing reports and reconciliation logic.
+
+account.move.line:
+  fields:
+    name:                 { strategy: keep, note: "Usually a product/service description, not PII — review for your industry. Professional-services or medical billing lines can leak client specifics here ('Consulting re: J. Smith custody case'); switch to redact_freetext if that applies to you." }
+
+account.payment:
+  fields:
+    memo:                  { strategy: redact_freetext }
+
+account.bank.statement.line:
+  fields:
+    payment_ref:            { strategy: redact_freetext }
+    narration:              { strategy: redact_freetext }
+    partner_name:            { strategy: fake_person_name, note: "Denormalized copy of the payer's name from the bank feed — mask independently, it isn't guaranteed to match res.partner.name verbatim." }
+
+payment.transaction:
+  fields:
+    reference:               { strategy: partial_keep_last4 }
+    partner_name:             { strategy: fake_person_name }
+    partner_email:            { strategy: fake_email }
+    partner_phone:            { strategy: fake_phone }
+    provider_reference:       { strategy: drop, note: "Live reference ID at the actual payment gateway. Never let this survive into a non-prod copy." }
+    state_message:            { strategy: drop, note: "Free text from the gateway; some providers echo partial card data or billing details into this field." }
+
+payment.token:
+  fields:
+    payment_details:          { strategy: drop, note: "Display value like '**** 4242' — cosmetically already partial, but see provider_ref below for why the row is still dangerous." }
+    provider_ref:             { strategy: drop, note: "This is a live handle to a real saved payment method at the processor. A 'masked' token is still a functioning token. Drop it; do not try to disguise it." }
+    active:                   { strategy: rotate_secret, note: "Force to false regardless of source value — belt-and-suspenders alongside dropping provider_ref." }
+
+payment.provider:
+  fields:
+    stripe_secret_key:        { strategy: drop }
+    stripe_publishable_key:   { strategy: drop }
+    paypal_seller_account:    { strategy: drop }
+    # field names vary by installed payment provider module — treat this
+    # as a pattern to replicate per provider you have installed, not an
+    # exhaustive list.
+    state:                    { strategy: rotate_secret, note: "Force to 'disabled' regardless of source value. Do this even though odoo-bin's --neutralize also disables providers operationally — this rule protects the credential fields specifically, which neutralize does not touch." }
