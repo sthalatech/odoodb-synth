@@ -28,7 +28,7 @@ dependencies = [
 
 [project.optional-dependencies]
 parquet = ["duckdb>=0.10"]
-dev = ["pytest>=8.0"]
+dev = ["pytest>=8.0", "python-stdnum>=1.20"]
 
 [project.scripts]
 odoo-synth = "odoo_synth.cli:app"

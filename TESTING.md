@@ -32,11 +32,20 @@ For each function in `sql/bootstrap.sql`, assert:
   a bug that silently no-ops a masking function is worse than one
   that crashes).
 - **Format validity**: `fake_vat()` output matches the country-prefix
-  pattern and digit count of the input; `fake_iban()` output passes a
-  standard mod-97 IBAN checksum check (there are small Python/Postgres
-  libraries for this — don't hand-roll the checksum verification
-  separately from the generation, use the same reference
-  implementation both places would defeat the purpose of the test).
+  pattern and digit count of the input; `fake_iban()` output satisfies
+  the generic ISO 7064 mod-97 checksum (Odoo's own IBAN field validator
+  runs this check). Note: this is the generic mod-97 check only —
+  `fake_iban` is NOT verified against stricter country-specific BBAN
+  validators (e.g. python-stdnum's per-country checks; GB fakes lack a
+  valid UK sort-code structure, NL fakes fail the Dutch elfproef). That's
+  a documented known limitation in sql/bootstrap.sql, not a hidden gap.
+  When writing the test, use a reference mod-97 implementation
+  independent of the generation code — verifying generated output against
+  the same formula that generated it is tautological and won't catch a
+  generation bug (there are small Python/Postgres libraries for this —
+  don't hand-roll the checksum verification separately from the
+  generation, using the same reference implementation both places would
+  defeat the purpose of the test).
 - **NULL passthrough**: `NULL` in → `NULL` out, no exceptions thrown.
 
 Run with `pytest tests/unit/` against a throwaway Postgres container

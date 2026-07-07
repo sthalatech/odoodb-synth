@@ -164,11 +164,18 @@ $$ LANGUAGE plpgsql VOLATILE;
 -- ------------------------------------------------------------------
 -- odoo_synth.fake_iban(source_value text) returns text
 --
--- Format-preserving AND checksum-valid. Keeps the ISO country code (first
--- 2 chars) and total length, deterministically generates the BBAN, and
--- recomputes the mod-97 check digits per ISO 7064 so the result passes
--- standard IBAN validation (rearrange country code + check digits to the
--- end, convert letters A=10..Z=35, mod 97, check digits = 98 - remainder).
+-- Format-preserving AND mod-97 checksum-valid. Keeps the ISO country code
+-- (first 2 chars) and total length, deterministically generates the BBAN,
+-- and recomputes the mod-97 check digits per ISO 7064 so the result passes
+-- the generic ISO 7064 mod-97 checksum Odoo's own IBAN field validator runs.
+--
+-- KNOWN LIMITATION (same honesty standard as fake_vat): the output is only
+-- verified against the generic mod-97 check, not stricter country-specific
+-- BBAN validators (e.g. python-stdnum's per-country checks). GB fakes don't
+-- carry a valid UK sort-code structure; NL fakes don't satisfy the Dutch
+-- elfproef. Odoo's field validator does not run those stricter checks on
+-- input, so this is enough to load cleanly, but it's NOT a claim of full
+-- per-country IBAN validity. See TESTING.md section 2.
 -- Non-IBAN inputs (don't match ^[A-Za-z]{2}[0-9]{2}[0-9A-Za-z]+$) fall back
 -- to odoo_synth.fake_bank_account().
 -- ------------------------------------------------------------------

@@ -2,13 +2,21 @@
 #
 # Runs on every PR (and push to main):
 #   1. odoo-synth rules validate -- the cheapest gate, no DB needed.
-#   2. pytest tests/unit/ -- layer 1 (rulebook, no DB) + layer 2 (SQL
-#      functions, needs the postgres-anon scratch container).
+#   2. pytest tests/unit/ tests/integration/test_mask.py
+#      tests/integration/test_snapshot_cli.py -- layer 1 (rulebook, no DB)
+#      + layer 2 (SQL functions, needs postgres-anon) + the mask-application
+#      and CLI round-trip tests (also only need postgres-anon, not the full
+#      Odoo stack). These all run against the postgres-anon service container.
 #
-# Integration tests (tests/integration/) need both the postgres-anon and
-# Odoo containers and are intentionally NOT in this workflow per
-# TESTING.md -- they're slow and spin real containers. Run them manually
-# or in a separate nightly job (P1 item #13 / TESTING.md section 3-4).
+# The full-Odoo-stack integration tests (test_end_to_end.py,
+# test_round_trip_provision.py) need the Odoo container too and are
+# intentionally NOT in this workflow per TESTING.md -- they're slow and spin
+# a second container. They're gated behind ODOO_SYNTH_RUN_INTEGRATION=1 and
+# run in a separate nightly job (P1 item #13 / TESTING.md section 3-4).
+#
+# The scratch stack's pg_dump is the same major as the server (both 18 in
+# the pinned anon image), so no version-mismatch workaround envs are needed
+# in CI -- the host pg_dump (PG18, from the setup-pg step) handles it.
 
 name: ci
 
@@ -50,6 +58,20 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      # Install PG client tools matching the anon image's server major (18).
+      # The snapshot CLI calls pg_dump/pg_restore; a version-matched client
+      # avoids the "server version mismatch" error. On ubuntu-latest the
+      # PGDG repo ships postgresql-client-18.
+      - name: Install PostgreSQL 18 client tools (pg_dump/psql/pg_restore)
+        run: |
+          sudo install -d /etc/apt/keyrings
+          wget -qO- https://www.postgresql.org/media/keys/ACCC4CF8.asc | \
+            gpg --dearmor -o /etc/apt/keyrings/pgdg.gpg
+          echo "deb [signed-by=/etc/apt/keyrings/pgdg.gpg] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | \
+            sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client-18
+
       - name: Load SQL bootstrap functions into scratch DB
         run: |
           psql "$SCRATCH_DB_URL" -f sql/bootstrap.sql
@@ -61,3 +83,12 @@ jobs:
 
       - name: Unit tests (rulebook + SQL functions)
         run: pytest tests/unit/ -v
+
+      # Mask-application + CLI round-trip tests: only need postgres-anon
+      # (already up as a service), not the Odoo container. The snapshot_cli
+      # test exercises the real `odoo-synth snapshot` + `odoo-synth up` path
+      # against a seeded Odoo-shaped source DB.
+      - name: Integration tests (mask + CLI round-trip, postgres-anon only)
+        env:
+          SCRATCH_DB_URL: postgresql://odoo_synth:odoo_synth@localhost:5432/scratch
+        run: pytest tests/integration/test_mask.py tests/integration/test_snapshot_cli.py -v

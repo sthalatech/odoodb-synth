@@ -35,26 +35,53 @@ SAMPLE_TEXTS = ["short", "A longer free-text note with real PII inside: John's h
 
 
 # ---------------------------------------------------------------------------
-# mod-97 IBAN verification (reference implementation)
+# mod-97 IBAN verification -- INDEPENDENT oracle
 # ---------------------------------------------------------------------------
+#
+# IMPORTANT (from the phase-3 prompt): a test that verifies generated output
+# against the *same* arithmetic the generation code uses is tautological --
+# it can't catch a generation bug. The first version of this test hand-rolled
+# the exact mod-97 procedure sql/bootstrap.sql::fake_iban uses, so a bug in
+# either place would agree with itself.
+#
+# We instead use python-stdnum's stdnum.iso7064.mod_97_10, a third-party
+# reference implementation of ISO 7064 mod-97-10. It is a separate code path
+# from the PL/pgSQL generator, so a generation bug that produces a
+# mod-97-invalid IBAN fails here. stdnum.iban.is_valid additionally runs
+# per-country BBAN validators (UK sort-code structure, Dutch elfproef, etc.)
+# which fake_iban deliberately does NOT satisfy -- that's the documented
+# known limitation in sql/bootstrap.sql, and test_fake_iban_known_limitations
+# asserts it explicitly rather than leaving it as a hidden gap.
+
+try:
+    from stdnum.iso7064 import mod_97_10 as _mod97
+except ImportError:  # pragma: no cover
+    _mod97 = None
 
 
-def _iban_mod97_valid(iban: str) -> bool:
-    """ISO 7064 mod-97 check: rearrange, convert letters A=10..Z=35, mod 97 == 1."""
-    s = iban.upper().replace(" ", "")
+def _iban_generic_mod97_ok(iban: str) -> bool:
+    """Generic ISO 7064 mod-97 check via python-stdnum (independent oracle)."""
+    if _mod97 is None:
+        pytest.skip('python-stdnum not installed (dev extra); pip install -e \".[dev]\"')
+    s = "".join(iban.upper().split())
     if len(s) < 5:
         return False
-    rearr = s[4:] + s[:4]
-    num = ""
-    for c in rearr:
-        if c.isdigit():
-            num += c
-        elif c.isalpha():
-            num += str(ord(c) - 55)  # A=10..Z=35
-        else:
-            return False
-    # Python handles arbitrary-precision ints, so the whole-string mod is fine.
-    return int(num) % 97 == 1
+    rearr = s[4:] + s[:4]  # BBAN + country code + check digits
+    try:
+        return bool(_mod97.is_valid(rearr))
+    except Exception:
+        return False
+
+
+def _iban_strict_country_ok(iban: str) -> bool:
+    """python-stdnum's full per-country IBAN check (sort code / elfproef / ...)."""
+    if _mod97 is None:
+        pytest.skip("python-stdnum not installed (dev extra)")
+    from stdnum import iban as _iban
+    try:
+        return bool(_iban.is_valid(iban))
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -138,8 +165,39 @@ def test_fake_iban_mod97_valid_and_format_preserving(cur, value):
     # Country code + total length preserved.
     assert out[:2] == value[:2].upper(), f"country code changed: {value} -> {out}"
     assert len(out) == len(value), f"length changed: {value}({len(value)}) -> {out}({len(out)})"
-    # The real acceptance criterion: output passes mod-97.
-    assert _iban_mod97_valid(out), f"fake_iban output fails mod-97: {out}"
+    # The real acceptance criterion: output passes the generic mod-97 check,
+    # verified by an INDEPENDENT oracle (python-stdnum), not the same formula
+    # fake_iban used to generate the check digits.
+    assert _iban_generic_mod97_ok(out), f"fake_iban output fails mod-97: {out}"
+
+
+def test_fake_iban_known_limitations(cur):
+    """Documents what fake_iban does NOT guarantee, asserted not assumed.
+
+    The generic mod-97 is satisfied (tested above with an independent
+    oracle); stricter per-country BBAN validators are not. GB fakes lack a
+    valid UK sort-code structure; NL fakes fail the Dutch elfproef. This is
+    the known limitation spelled out in sql/bootstrap.sql's header and
+    TESTING.md -- asserted here so a future change that accidentally makes
+    fakes country-valid (or one that breaks the generic check) gets caught.
+    """
+    # GB and NL both have country-specific BBAN checks in python-stdnum.
+    gb = _det(cur, "odoo_synth.fake_iban", "GB29NWBK60161331926819")
+    nl = _det(cur, "odoo_synth.fake_iban", "NL91ABNA0417164300")
+    # Generic mod-97 must hold for both (the actual contract).
+    assert _iban_generic_mod97_ok(gb), f"GB fake fails generic mod-97: {gb}"
+    assert _iban_generic_mod97_ok(nl), f"NL fake fails generic mod-97: {nl}"
+    # And the strict per-country checks are NOT guaranteed to pass -- if
+    # they ever do start passing that's fine, but we must not regress the
+    # generic check. We assert the limitation is real (at least one of GB/NL
+    # fails strict) so the documented claim is verified, not folklore.
+    strict_results = {v: _iban_strict_country_ok(v) for v in (gb, nl)}
+    assert not all(strict_results.values()), (
+        "fake_iban's documented per-country limitation appears to no longer "
+        f"hold: strict validation results {strict_results}. If fake_iban now "
+        "satisfies per-country BBAN checks too, update sql/bootstrap.sql and "
+        "TESTING.md to drop the limitation note -- this is a strict improvement."
+    )
 
 
 def test_fake_iban_null_passthrough(cur):
