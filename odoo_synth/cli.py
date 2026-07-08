@@ -1,10 +1,10 @@
 """odoo-synth CLI entrypoint.
 
 Wires up every subcommand defined in AGENT_PROMPT.md's CLI surface.
-`rules validate` is fully implemented (P0). The other subcommands exist
-and appear in --help, but raise NotImplementedError pointing at the
-relevant P1 item until they are built -- they never silently no-op or
-fake success.
+`rules validate`, `rules scan`, `rules diff`, `snapshot`, `up`, and `ingest`
+are all implemented. The only remaining stub is `odoo_sh.pull_via_ssh`
+(the deferred v2 SSH-automation path) -- it raises NotImplementedError by
+design, never silently no-ops.
 """
 
 from __future__ import annotations
@@ -16,6 +16,8 @@ from typing import Optional
 import typer
 
 from .core.rulebook import RulebookError, load_and_validate, validate_directory
+from .core.schema import SchemaSnapshot, load_snapshot
+from .core.coverage import CoverageReport, analyze
 
 app = typer.Typer(
     name="odoo-synth",
@@ -70,8 +72,30 @@ def rules_validate(
 
 
 # ---------------------------------------------------------------------------
-# rules scan / rules diff  (P1 -- TODO, explicit)
+# rules scan / rules diff  (P1 #8/#12 -- implemented)
+# Compares the rulebook against a bundle's schema.json snapshot and flags
+# PII-shaped columns the rulebook doesn't cover. See core/coverage.py.
 # ---------------------------------------------------------------------------
+
+
+def _resolve_snapshot(bundle: Path) -> SchemaSnapshot:
+    """Load schema.json from a bundle, or raise a clear error if absent.
+
+    `rules scan`/`rules diff` compare the rulebook against a schema snapshot.
+    Both producers write schema.json: package() from the live catalog (self-
+    hosted), odoo_sh.ingest() from the bundle's dump.sql (odoo.sh). If the
+    sidecar is missing the bundle predates this feature -- tell the operator
+    to re-run snapshot/ingest rather than guessing at an empty result.
+    """
+    sidecar = bundle / "schema.json"
+    if sidecar.exists():
+        return load_snapshot(sidecar)
+    raise RulebookError(
+        f"{bundle}/schema.json not found -- this bundle has no schema "
+        "snapshot. Re-run `odoo-synth snapshot` (self-hosted) or "
+        "`odoo-synth ingest` (odoo.sh) to regenerate it. `rules scan`/"
+        "`rules diff` need the snapshot to know which columns exist."
+    )
 
 
 @rules_app.command("scan")
@@ -79,14 +103,31 @@ def rules_scan(
     bundle: str = typer.Option(..., "--bundle", help="Path to an ingested bundle to scan."),
     rules: str = typer.Option("rules/", "--rules", help="Path to the rules/ directory."),
 ) -> None:
-    """Flag undeclared PII-shaped fields in a schema snapshot."""
-    raise NotImplementedError(
-        "rules scan is not implemented yet -- P1 item #12/#8 in the phase-2 "
-        "plan. It will flag new Char/Text/Many2one(res.partner) fields on "
-        "installed models that aren't declared `keep` or given a strategy. "
-        "For now, run `odoo-synth rules validate` to check the rulebook's "
-        "internal consistency."
-    )
+    """Flag undeclared PII-shaped fields in a schema snapshot.
+
+    Per rules/README.md: flags Char/Text/Many2one(res.partner)/bytea columns on
+    installed models that aren't declared `keep` or given a strategy. Use
+    after installing a new module to find what the rulebook doesn't cover yet.
+    Exits non-zero if any findings, so it's also a usable CI gate.
+    """
+    bundle_path = Path(bundle)
+    if not bundle_path.is_dir():
+        _fail(f"bundle not found: {bundle_path}")
+        return
+    try:
+        rb = load_and_validate(rules)
+        snap = _resolve_snapshot(bundle_path)
+        report = analyze(rb, snap)
+    except RulebookError as exc:
+        _fail(str(exc))
+        return
+    _print_scan_report(report)
+    if report.has_findings:
+        _fail(f"{len(report.findings)} undeclared PII-shaped field(s) found -- "
+              "add rules or declare `keep` for the reviewed ones.")
+    else:
+        typer.secho("OK: rulebook covers every PII-shaped column in the snapshot.",
+                    fg=typer.colors.GREEN)
 
 
 @rules_app.command("diff")
@@ -94,13 +135,28 @@ def rules_diff(
     bundle: str = typer.Option(..., "--bundle", help="Path to a schema snapshot bundle."),
     rules: str = typer.Option("rules/", "--rules", help="Path to the rules/ directory."),
 ) -> None:
-    """CI gate: diff a schema snapshot against the rulebook's coverage."""
-    raise NotImplementedError(
-        "rules diff is not implemented yet -- P1 item #12/#8 in the phase-2 "
-        "plan. It runs the same check as `rules scan` against a schema "
-        "snapshot in CI so the rulebook doesn't silently rot as your "
-        "instance evolves."
-    )
+    """CI gate: diff a schema snapshot against the rulebook's coverage.
+
+    Same check as `rules scan` but intended for CI: exits non-zero on any
+    finding so the rulebook can't silently rot as the instance evolves.
+    """
+    rules_scan(bundle=bundle, rules=rules,)
+
+
+def _print_scan_report(report: CoverageReport) -> None:
+    """Human-readable findings list + summary."""
+    typer.echo(report.summary())
+    if not report.findings:
+        return
+    typer.echo("")
+    typer.echo("Undeclared PII-shaped fields:")
+    for f in report.findings:
+        fk = f" -> {f.fk_target}" if f.fk_target else ""
+        nn = " NOT NULL" if f.not_null else ""
+        typer.echo(
+            f"  {f.table}.{f.column}  [{f.shape}] {f.data_type}{nn}{fk}"
+            f"\n      {f.reason}"
+        )
 
 
 # ---------------------------------------------------------------------------

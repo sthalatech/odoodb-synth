@@ -18,6 +18,34 @@ This is what catches copy-paste drift as the rulebook grows — cheap
 enough to run on every commit, and it's the first thing that should
 fail if someone adds a rule file with a typo'd strategy name.
 
+## 1b. Rulebook coverage / drift (seconds, no live DB needed)
+
+`rules scan` and `rules diff` compare the rulebook against a **schema
+snapshot** (`schema.json`) that `odoo-synth snapshot` (self-hosted) and
+`odoo-synth ingest` (odoo.sh) write alongside `db.dump`. They flag PII-shaped
+columns — `Char`/`Text`, `bytea`, and `Many2one(res.partner)` — that the
+rulebook doesn't cover, so the rulebook can't silently rot as you install
+new modules. `rules diff` exits non-zero on findings so it's a usable CI
+gate.
+
+```
+odoo-synth rules scan  --bundle /path/to/snapshot  --rules rules/   # human report
+odoo-synth rules diff  --bundle /path/to/snapshot  --rules rules/   # same, for CI
+```
+
+A column is "covered" if the rulebook has any entry for `(model, field)` —
+including `keep`, which is the explicit "reviewed, non-sensitive" mark.
+A model with no rulebook entry at all is reported as an **undeclared model**
+(strongest signal — the whole model needs review). The classifier is
+deliberately conservative: it over-flags for human review rather than
+silently letting a sensitive field ship unmasked. See `odoo_synth/core/
+coverage.py` for the shape rules and `rules/README.md` for the design.
+
+Unit tests: `tests/unit/test_coverage.py` (pure logic, no DB) and
+`tests/unit/test_odoo_sh_ingest.py` (zip-parse, no DB). Integration test:
+`tests/integration/test_scan_cli.py` (real `odoo-synth snapshot` +
+`rules scan` against postgres-anon).
+
 ## 2. SQL function unit tests (needs bare Postgres + `anon`, no Odoo)
 
 For each function in `sql/bootstrap.sql`, assert:

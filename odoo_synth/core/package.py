@@ -26,6 +26,7 @@ from pathlib import Path
 from typing import Any
 
 from .rulebook import Rulebook
+from .schema import snapshot_from_db
 
 
 class PackageError(Exception):
@@ -62,6 +63,22 @@ def package(cfg: PackageConfig, rulebook: Rulebook | None = None) -> Path:
     # 2. Schema hash (from a schema-only plain dump, sha256).
     schema_hash = _schema_hash(cfg.db_url)
 
+    # 2b. Schema snapshot sidecar -- the oracle `rules scan`/`rules diff`
+    # compare the rulebook against. Built from the catalogs (lossy but
+    # enough for the PII-shape classifier). Written to schema.json next to
+    # the manifest so a bundle is self-describing.
+    try:
+        snap = snapshot_from_db(cfg.db_url)
+        (out / "schema.json").write_text(snap.to_json(), "utf-8")
+        schema_source = snap.source
+        schema_tables = len(snap.tables)
+    except Exception as exc:
+        # A missing snapshot makes `rules scan` refuse (it needs the oracle),
+        # but packaging the primary artifact should still succeed. Record
+        # the failure in the manifest so it's not silently absent.
+        schema_source = f"error: {exc}"
+        schema_tables = 0
+
     # 3. Row counts per table.
     row_counts = _row_counts(cfg.db_url)
 
@@ -81,6 +98,8 @@ def package(cfg: PackageConfig, rulebook: Rulebook | None = None) -> Path:
         "rulebook_field_rules": len(rulebook.field_rules) if rulebook else None,
         "primary_artifact": "db.dump",
         "parquet_tables": parquet_tables,
+        "schema_source": schema_source,
+        "schema_tables": schema_tables,
     }
     (out / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), "utf-8"

@@ -139,6 +139,16 @@ def _normalize_bundle(out_dir: Path, manifest: dict, rules_dir: str | Path | Non
         "odoo_version": str(manifest.get("odoo_version") or manifest.get("odoo-version") or ""),
         "manifest_filename_in_zip": manifest.get("manifest_filename_in_zip"),
     })
+
+    # Build a schema.json sidecar from the bundle's dump.sql, if present, so
+    # `rules scan` can run against an odoo.sh bundle without a live DB. This
+    # is a best-effort parse (see core/schema.snapshot_from_dump_sql); the
+    # unparsed tables are surfaced in the snapshot so the scan reports the
+    # gap instead of silently trusting an empty result.
+    schema_report = _maybe_write_schema_snapshot(content_dir, out_dir)
+    if schema_report:
+        existing["schema_snapshot"] = schema_report
+
     mf_path.write_text(json.dumps(existing, indent=2, sort_keys=True), "utf-8")
 
     report: dict[str, Any] = {"undeclared_modules": []}
@@ -153,6 +163,38 @@ def _normalize_bundle(out_dir: Path, manifest: dict, rules_dir: str | Path | Non
     if module_names and rules_dir:
         report["undeclared_modules"] = _flag_undeclared_modules(module_names, Path(rules_dir))
     return report
+
+
+def _maybe_write_schema_snapshot(content_dir: Path, out_dir: Path) -> dict[str, Any]:
+    """Parse dump.sql (if present in the bundle) into a schema.json sidecar.
+
+    Returns a small report dict for the manifest (parsed-table count + any
+    unparsed tables). No-op if there's no dump.sql. odoo.sh backups ship a
+    plain-text dump.sql by default; if this is a custom-format dump.dump we
+    can't parse it textually and skip (the self-hosted path writes schema.json
+    from the catalog instead).
+    """
+    from ..core.schema import snapshot_from_dump_sql
+
+    dump_sql = content_dir / "dump.sql"
+    if not dump_sql.exists():
+        # Some bundles nest it one more level.
+        cand = list(out_dir.rglob("dump.sql"))
+        if cand:
+            dump_sql = cand[0]
+    if not dump_sql.exists():
+        return {"present": False}
+    try:
+        snap = snapshot_from_dump_sql(dump_sql.read_text("utf-8", errors="replace"))
+        (out_dir / "schema.json").write_text(snap.to_json(), "utf-8")
+        return {
+            "present": True,
+            "source": snap.source,
+            "tables": len(snap.tables),
+            "unparsed_tables": len(snap.unparsed_tables),
+        }
+    except Exception as exc:
+        return {"present": True, "error": str(exc)}
 
 
 def _flag_undeclared_modules(modules: list[str], rules_dir: Path) -> list[str]:

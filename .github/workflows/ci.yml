@@ -81,14 +81,16 @@ jobs:
       - name: Rulebook validation
         run: odoo-synth rules validate --rules rules/
 
-      - name: Unit tests (rulebook + SQL functions)
+      - name: Unit tests (rulebook + SQL functions + coverage + ingest)
         run: pytest tests/unit/ -v
 
       # Mask-application + CLI round-trip tests: only need postgres-anon
-      # (already up as a service), not the Odoo container. The snapshot_cli
-      # test exercises the real `odoo-synth snapshot` + `odoo-synth up` path
-      # against a seeded Odoo-shaped source DB.
-      - name: Integration tests (mask + CLI round-trip, postgres-anon only)
+      # (already up as a service), not the Odoo container. test_snapshot_cli
+      # exercises the real `odoo-synth snapshot` + `odoo-synth up` path;
+      # test_scan_cli exercises `odoo-synth snapshot` writing schema.json +
+      # `odoo-synth rules scan`/`rules diff` flagging gaps against the real
+      # rulebook (the CI gate against rulebook rot).
+      - name: Integration tests (mask + CLI round-trip + rules scan, postgres-anon only)
         env:
           SCRATCH_DB_URL: postgresql://odoo_synth:odoo_synth@localhost:5432/scratch
-        run: pytest tests/integration/test_mask.py tests/integration/test_snapshot_cli.py -v
+        run: pytest tests/integration/test_mask.py tests/integration/test_snapshot_cli.py tests/integration/test_scan_cli.py -v
