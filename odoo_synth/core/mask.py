@@ -68,6 +68,7 @@ _BUILTIN_FN_QUALIFY = {
 # non-field-rule structure under Rulebook.raw).
 
 ATTACHMENTS_FILE = "50_attachments.yml"
+MODULE_METADATA_FILE = "55_module_metadata.yml"
 
 
 class MaskError(Exception):
@@ -148,6 +149,16 @@ class MaskPlan:
     shuffle_rules: list[tuple[str, str]]  # (model, field)
     rotate_secret_rules: list[tuple[str, str]]  # (model, field) from 60_*.yml
     attachment_full_scrub_models: list[str]
+    # Per-view targeted arch_db string-replace rules from 55_module_metadata.yml.
+    # Each entry is a view key (ir_ui_view.key) whose arch_db should have every
+    # distinct res_company.name replaced with that company's masked name. See
+    # _apply_scoped_arch_replace(). Not a SECURITY LABEL -- a label on arch_db
+    # would redact every view's definition and break the app.
+    scoped_arch_replace_views: list[str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.scoped_arch_replace_views is None:
+            self.scoped_arch_replace_views = []
 
 
 def build_plan(rulebook: Rulebook) -> MaskPlan:
@@ -222,11 +233,25 @@ def build_plan(rulebook: Rulebook) -> MaskPlan:
         if isinstance(m, list):
             att_models = [str(x) for x in m]
 
+    # Scoped arch_db string-replace view keys from 55_module_metadata.yml.
+    # ir.ui.view.scoped_arch_replace is a list of {view_key: ...} entries.
+    arch_views: list[str] = []
+    meta_doc = rulebook.raw.get(MODULE_METADATA_FILE, {}) or {}
+    if isinstance(meta_doc, dict):
+        iuiv = meta_doc.get("ir.ui.view", {})
+        if isinstance(iuiv, dict):
+            sar = iuiv.get("scoped_arch_replace") or []
+            if isinstance(sar, list):
+                for entry in sar:
+                    if isinstance(entry, dict) and entry.get("view_key"):
+                        arch_views.append(str(entry["view_key"]))
+
     return MaskPlan(
         label_statements=labels,
         shuffle_rules=shuffles,
         rotate_secret_rules=rotates,
         attachment_full_scrub_models=att_models,
+        scoped_arch_replace_views=arch_views,
     )
 
 
@@ -350,6 +375,111 @@ def build_pattern_labels(rulebook: Rulebook, snapshot) -> tuple[list[str], int, 
 
 
 # ---------------------------------------------------------------------------
+# Scoped arch_db string-replace (rules/55_module_metadata.yml)
+# ---------------------------------------------------------------------------
+
+
+def _apply_scoped_arch_replace(
+    cur,
+    view_keys: list[str],
+    company_names_pre: list[tuple[int, str]],
+) -> dict[str, int]:
+    """Targeted literal string-replace inside specific ir_ui_view rows.
+
+    A custom module's report/view template can hardcode the real org name as
+    a literal in its arch_db (rendered XML) -- e.g. isha_darkstore's
+    packing-slip report prints "Dark Store Fulfillment — <Isha Life Pvt Ltd>"
+    in the footer. A SECURITY LABEL on ir_ui_view.arch_db would redact EVERY
+    view's definition and break the whole app, so this is a scoped
+    post-anonymize UPDATE, not a label.
+
+    For every view key in `view_keys`, and every distinct res_company.name,
+    replace the real name (captured pre-mask in `company_names_pre`) with the
+    same company's now-masked name (read from res_company post-mask, paired by
+    id). Replacements are applied longest-name-first so a short name can't
+    clobber a longer one that contains it as a prefix ("Isha Life Pvt Ltd"
+    must not be rewritten inside "Isha Life Pvt Ltd - Tamil Nadu" before the
+    longer string gets its own replacement). Only views explicitly listed in
+    the rulebook are touched; every other view is left verbatim.
+
+    Returns a summary dict: {views_touched, rows_updated, names_replaced}.
+    Skips silently (counts as 0) when ir_ui_view or res_company is missing, or
+    when a listed view key isn't present in this instance (module not
+    installed) -- same skip semantics as the attachment/rotate passes.
+    """
+    summary = {"views_touched": 0, "rows_updated": 0, "names_replaced": 0}
+    if not view_keys:
+        return summary
+    if not _exists(cur, "ir_ui_view"):
+        return summary
+    if not company_names_pre:
+        return summary
+
+    # Read the now-masked company names (post anonymize_database), paired by
+    # id with the pre-mask names. Drop empties on either side.
+    pairs: list[tuple[str, str]] = []
+    cur.execute("SELECT id, name FROM res_company ORDER BY id")
+    post_map = {r[0]: (r[1] or "") for r in cur.fetchall()}
+    for cid, old_name in company_names_pre:
+        new_name = post_map.get(cid, "")
+        if old_name and new_name and old_name != new_name:
+            pairs.append((old_name, new_name))
+    if not pairs:
+        return summary
+    # Longest real name first, so a prefix can't be rewritten inside a longer
+    # name that hasn't been handled yet.
+    pairs.sort(key=lambda p: len(p[0]), reverse=True)
+
+    for view_key in view_keys:
+        # Resolve the view row by key. arch_db is jsonb (Odoo 19); the literal
+        # lives in each locale's value. We operate on the whole jsonb object
+        # with replace-on-text-cast per locale key. Use a per-row UPDATE so we
+        # only touch this one view's row.
+        cur.execute(
+            "SELECT id, arch_db FROM ir_ui_view WHERE key = %s", (view_key,)
+        )
+        rows = cur.fetchall()
+        if not rows:
+            continue  # view not present in this instance (module not installed)
+        touched = False
+        import json
+        for vid, arch_db in rows:
+            if arch_db is None:
+                continue
+            # psycopg decodes jsonb to a Python dict/list/scalar by default.
+            # We rewrite string values in place (the arch XML lives in the
+            # locale-keyed string values), longest-name-first, then json.dumps
+            # back to a jsonb-accepting text. Operating on the decoded structure
+            # (not str() of it) keeps the output valid JSON -- str(dict) uses
+            # Python single-quote repr which is NOT valid JSON.
+            def _rewrite(node):
+                if isinstance(node, str):
+                    out = node
+                    for old_name, new_name in pairs:
+                        if old_name in out:
+                            out = out.replace(old_name, new_name)
+                    return out
+                if isinstance(node, dict):
+                    return {k: _rewrite(v) for k, v in node.items()}
+                if isinstance(node, list):
+                    return [_rewrite(v) for v in node]
+                return node
+            new_arch = _rewrite(arch_db)
+            if new_arch != arch_db:
+                arch_text = json.dumps(new_arch, ensure_ascii=False)
+                cur.execute(
+                    "UPDATE ir_ui_view SET arch_db = %s::jsonb WHERE id = %s",
+                    (arch_text, vid),
+                )
+                summary["rows_updated"] += 1
+                touched = True
+        if touched:
+            summary["views_touched"] += 1
+        summary["names_replaced"] += len(pairs)
+    return summary
+
+
+# ---------------------------------------------------------------------------
 # Attachment policy (rules/50_attachments.yml)
 # ---------------------------------------------------------------------------
 
@@ -440,6 +570,18 @@ def apply_masking(scratch_db_url: str, rulebook: Rulebook) -> dict[str, Any]:
             # 0. Trust the odoo_synth schema so anon accepts our funcs.
             cur.execute("SECURITY LABEL FOR anon ON SCHEMA odoo_synth IS 'TRUSTED';")
 
+            # 0b. Snapshot the real res_company names BEFORE masking, so the
+            # scoped arch_db replace pass (step 6) can map each real name to
+            # its masked counterpart and rewrite it in the listed views' XML.
+            # See _apply_scoped_arch_replace() + rules/55_module_metadata.yml.
+            company_names_pre: list[tuple[int, str]] = []
+            if plan.scoped_arch_replace_views and _exists(cur, "res_company"):
+                try:
+                    cur.execute("SELECT id, name FROM res_company ORDER BY id")
+                    company_names_pre = [(r[0], r[1] or "") for r in cur.fetchall()]
+                except psycopg.Error:
+                    company_names_pre = []
+
             # 1. Per-column labels (explicit per-model field rules).
             labels_applied, labels_skipped = _exec_script(cur, plan.label_statements)
 
@@ -519,6 +661,16 @@ def apply_masking(scratch_db_url: str, rulebook: Rulebook) -> dict[str, Any]:
             # 5. Attachment pass.
             att = _apply_attachment_policy(cur, plan.attachment_full_scrub_models)
 
+            # 6. Scoped arch_db string-replace pass (55_module_metadata.yml).
+            #    Runs AFTER anonymize_database() so res_company.name is already
+            #    masked -- we pair each pre-mask name (snapshotted in step 0b)
+            #    with the now-masked name and rewrite the literal in each listed
+            #    view's arch_db. Must run after masking, not before, because the
+            #    replacement value IS the masked company name.
+            arch = _apply_scoped_arch_replace(
+                cur, plan.scoped_arch_replace_views, company_names_pre
+            )
+
     return {
         "labels_applied": labels_applied,
         "labels_skipped": labels_skipped,
@@ -531,6 +683,7 @@ def apply_masking(scratch_db_url: str, rulebook: Rulebook) -> dict[str, Any]:
         "rotate_applied": rotate_applied,
         "rotate_skipped": rotate_skipped,
         "attachment": att,
+        "scoped_arch_replace": arch,
     }
 
 

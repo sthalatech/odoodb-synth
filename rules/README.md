@@ -21,6 +21,7 @@ and so reviewers can find things by app area:
 | `30_hr.yml` | Employees, contracts, recruitment |
 | `40_messaging.yml` | Chatter, mail, activities, calendar — the free-text problem lives here |
 | `50_attachments.yml` | Binary file policy (not per-field, per-model) |
+| `55_module_metadata.yml` | Org-name leaks in module metadata: `ir.module.module.author` (global null) + targeted `ir.ui.view.arch_db` string-replace for custom report templates that hardcode the org name |
 | `60_system_secrets.yml` | API keys, SMTP credentials, signing secrets — security hygiene, not PII |
 | `70_sales_crm_website.yml` | Leads, orders, newsletter lists, surveys |
 

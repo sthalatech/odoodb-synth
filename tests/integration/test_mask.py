@@ -478,3 +478,123 @@ def test_pattern_labels_mask_undeclared_cache_columns(isolated_db):
             rows = cur.fetchall()
             assert all(r[0] != "Real Company Inc" for r in rows), "pattern missed cache"
             assert all(r[1] != "Real Company Inc - child" for r in rows), "pattern missed complete_name"
+
+
+# ---------------------------------------------------------------------------
+# Module-metadata org-name leaks (55_module_metadata.yml)
+# ---------------------------------------------------------------------------
+
+_MODULE_SEED_TABLES = [
+    "res_partner", "res_company", "ir_module_module", "ir_ui_view",
+]
+
+
+def _seed_module_metadata(cur):
+    """Seed the two org-name leak vectors 55_module_metadata.yml closes:
+    ir_module_module.author (custom module author = org name) and
+    ir_ui_view.arch_db (custom report template hardcoding the org name)."""
+    for tbl in _MODULE_SEED_TABLES:
+        cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
+    cur.execute("""
+        CREATE TABLE res_company (
+            id serial PRIMARY KEY, name text, email text, phone text,
+            street text, city text, zip text, vat text, company_registry text,
+            website text, logo bytea
+        )
+    """)
+    # Real org name in res_company (the source the arch replace reads from).
+    cur.execute("""INSERT INTO res_company (name) VALUES
+        ('Isha Life Pvt Ltd'),
+        ('Isha Life Pvt Ltd - Tamil Nadu')""")
+    cur.execute("""
+        CREATE TABLE ir_module_module (
+            id serial PRIMARY KEY, name text, author text, state text
+        )
+    """)
+    # Custom module author = the org name; OCA module = third-party author.
+    cur.execute("""INSERT INTO ir_module_module (name, author, state) VALUES
+        ('isha_darkstore', 'Isha Life Pvt Ltd', 'installed'),
+        ('some_oca_module', 'Odoo S.A.', 'installed')""")
+    cur.execute("""
+        CREATE TABLE ir_ui_view (
+            id serial PRIMARY KEY, key text, name text, arch_db jsonb
+        )
+    """)
+    # Custom report template hardcodes the org name as a footer literal.
+    cur.execute("""INSERT INTO ir_ui_view (key, name, arch_db) VALUES
+        ('isha_darkstore.report_invoice_ds_packing_slip', 'report_invoice_ds_packing_slip',
+         '{"en_US": "<t><small>Dark Store Fulfillment - Isha Life Pvt Ltd</small></t>"}'::jsonb),
+        ('web.some_other_view', 'some_other_view',
+         '{"en_US": "<t>do not touch me Some Other Literal</t>"}'::jsonb)""")
+    return {
+        "org_name": "Isha Life Pvt Ltd",
+        "org_branch": "Isha Life Pvt Ltd - Tamil Nadu",
+        "oca_author": "Odoo S.A.",
+        "packing_slip_view_key": "isha_darkstore.report_invoice_ds_packing_slip",
+        "untouched_view_key": "web.some_other_view",
+    }
+
+
+def test_module_metadata_rules_close_org_name_leaks(isolated_db):
+    """55_module_metadata.yml must (1) null ir_module_module.author globally
+    and (2) replace the org name in ONLY the listed view's arch_db with the
+    masked company name, leaving every other view verbatim."""
+    from odoo_synth.core.rulebook import load_and_validate
+    from odoo_synth.core.mask import apply_masking, leak_scan
+    import psycopg
+
+    rb = load_and_validate(RULES_DIR)
+    with psycopg.connect(isolated_db, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            originals = _seed_module_metadata(cur)
+
+    summary = apply_masking(isolated_db, rb)
+    # The scoped arch replace pass must have run and touched the listed view.
+    assert summary["scoped_arch_replace"]["views_touched"] == 1, (
+        f"expected 1 view touched, got {summary['scoped_arch_replace']}")
+    assert summary["scoped_arch_replace"]["rows_updated"] == 1, (
+        f"expected 1 row updated, got {summary['scoped_arch_replace']}")
+
+    with psycopg.connect(isolated_db, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # 1. ir_module_module.author nulled globally (all rows, all modules).
+            cur.execute("SELECT author FROM ir_module_module ORDER BY id")
+            authors = [r[0] for r in cur.fetchall()]
+            assert all(a is None for a in authors), (
+                f"ir_module_module.author not nulled globally: {authors}")
+
+            # 2. The listed view's arch_db no longer contains the real org name,
+            #    but DOES contain the masked company name (proving replace, not
+            #    redact). Read the masked company name to compare.
+            cur.execute("SELECT name FROM res_company WHERE id=1")
+            masked_name = cur.fetchone()[0]
+            assert masked_name != originals["org_name"], "res.company.name not masked"
+            cur.execute("SELECT arch_db->>'en_US' FROM ir_ui_view "
+                        "WHERE key = %s", (originals["packing_slip_view_key"],))
+            arch = cur.fetchone()[0]
+            assert originals["org_name"] not in arch, (
+                f"packing-slip arch still leaks org name: {arch}")
+            assert masked_name in arch, (
+                f"packing-slip arch should carry masked name {masked_name!r}: {arch}")
+
+            # 3. The OTHER view is left verbatim -- NOT touched by the scoped pass.
+            cur.execute("SELECT arch_db->>'en_US' FROM ir_ui_view "
+                        "WHERE key = %s", (originals["untouched_view_key"],))
+            other_arch = cur.fetchone()[0]
+            assert "Some Other Literal" in other_arch, (
+                "scoped pass touched a view it should have left alone "
+                f"(only listed views may be rewritten): {other_arch}")
+
+    # Leak scan against the full set of original org-name values: must be clean.
+    leaks = leak_scan(isolated_db, [
+        originals["org_name"], originals["org_branch"], originals["oca_author"],
+    ])
+    # The OCA author 'Odoo S.A.' is a third-party string that also gets nulled
+    # by the global author drop, so it must be gone too. The other view still
+    # contains the org name (intentionally, per rule 2's scoping) -- but that
+    # view is NOT in our rulebook leak vectors here; in a real instance that
+    # other view would be a separate flagged item. For THIS test we assert the
+    # rulebook's declared vectors are clean.
+    assert originals["org_name"] not in leaks, f"org name still leaked: {leaks}"
+    assert originals["org_branch"] not in leaks, f"org branch still leaked: {leaks}"
+    assert originals["oca_author"] not in leaks, f"oca author still leaked: {leaks}"

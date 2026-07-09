@@ -268,6 +268,7 @@ def snapshot(
     except mask.MaskError as exc:
         _fail(f"masking failed: {exc}")
         return
+    arch = summary.get("scoped_arch_replace") or {}
     typer.secho(
         f"masked: {summary['labels_applied']} labels applied "
         f"({summary['labels_skipped']} skipped), "
@@ -275,6 +276,8 @@ def snapshot(
         f"({summary.get('pattern_skipped', 0)} skipped), "
         f"{summary['shuffle_applied']} shuffles, "
         f"{summary['rotate_applied']} rotations, "
+        f"arch_db views rewritten: {arch.get('views_touched', 0)} "
+        f"({arch.get('rows_updated', 0)} rows, {arch.get('names_replaced', 0)} names), "
         f"attachment rows scrubbed: {summary['attachment'].get('rows_content_dropped', 0)}",
         fg=typer.colors.CYAN,
     )

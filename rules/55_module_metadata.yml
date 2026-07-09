@@ -1,0 +1,47 @@
+# rules/55_module_metadata.yml
+#
+# Two org-name leaks that survive the PII pass because they live in
+# *module metadata*, not in the PII-bearing business tables the rest of
+# the rulebook covers. Both are explicit, targeted rules -- NOT column
+# patterns -- because each is a single known column, not a class of
+# denormalized caches.
+#
+# These are the residual matches from the darkstore leak-scan: the org's
+# own name ("Isha Life Pvt Ltd") appeared in custom-module metadata.
+# Customer PII was already clean; this file closes the org-self-reference
+# residue so the FULL leak baseline (not just the customer-PII subset)
+# scans clean.
+
+ir.module.module:
+  fields:
+    # ir_module_module.author holds the module author string. For a
+    # custom module it's the customer's own org name ("Isha Life Pvt
+    # Ltd"); for OCA/Odoo SA modules it's the third party's author. A
+    # masked dev instance has no functional need for any of these
+    # (nothing reads author at runtime), so null the column globally
+    # -- all rows, all modules. No per-module logic: a blanket `drop`
+    # label on the column does exactly that.
+    author:               { strategy: drop, note: "Module author provenance. Null globally -- not needed in a dev copy, and the custom module's author IS the org name we're trying not to leak." }
+
+ir.ui.view:
+  # NOT a per-column label. ir_ui_view.arch_db holds the rendered XML for
+  # EVERY view and report in the whole instance; a SECURITY LABEL on it
+  # would redact every view's definition and break the app. Instead this
+  # is a scoped post-anonymize UPDATE: for each view listed below, replace
+  # every distinct res_company.name literal in that view's arch_db with
+  # the masked version of the same company's name (read post-mask). The
+  # mechanism (see mask._apply_scoped_arch_replace) snapshots the real
+  # company names before masking, pairs each with its masked name after
+  # anonymize_database(), and rewrites the literal -- longest-name-first
+  # so a short name can't clobber a longer one that contains it.
+  #
+  # Add a view here ONLY when a custom module's template hardcodes the
+  # org name as a literal (verified by leak-scan). Do NOT add views
+  # speculatively -- this rewrites live template XML.
+  scoped_arch_replace:
+    - view_key: "isha_darkstore.report_invoice_ds_packing_slip"
+      note: >
+        Custom module report template hardcodes the org name as a footer
+        literal ("Dark Store Fulfillment — Isha Life Pvt Ltd"). Replace
+        with the masked company name so the rendered report no longer
+        leaks whose data this is.
