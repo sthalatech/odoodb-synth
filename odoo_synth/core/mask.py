@@ -113,10 +113,27 @@ def render_label(model: str, field: str, strategy_template: str) -> str:
     The returned string is a complete `SECURITY LABEL FOR anon ON COLUMN ...`
     statement. The label value is dollar-quoted ($$...$$) so the template's
     own single-quoted string literals survive verbatim.
+
+    Odoo 19 stores several formerly-text fields as `jsonb` (translated fields
+    became JSONB). `anon.partial(text, ...)` only accepts `text`, so a label
+    like `anon.partial(barcode, ...)` on a jsonb `res_partner.barcode` raises
+    `function anon.partial(jsonb, integer, unknown, integer) does not exist`.
+    The rulebook is verbatim, so we cast the column to text here -- the only
+    anon function in the shipped strategies that takes a bare text arg and
+    can land on a non-text column is `anon.partial`. (The `odoo_synth.*`
+    helpers and `anon.fake_*` helpers either accept anytype via their own
+    casts or only get applied to text-like columns per the rulebook.)
     """
     table = model_to_table(model)
     rendered = strategy_template.replace("{column}", field)
     rendered = _qualify_builtins(rendered)
+    # anon.partial({field}, ...) -> anon.partial({field}::text, ...) so a
+    # jsonb/varchar column is accepted by anon.partial(text, ...).
+    rendered = re.sub(
+        r"(anon\.partial\()" + re.escape(field) + r"\b(,)",
+        r"\1" + field + r"::text\2",
+        rendered,
+    )
     # Dollar-quote the whole label value. A template can't legitimately
     # contain $$ (no rulebook strategy uses it), so this is collision-free.
     return f"SECURITY LABEL FOR anon ON COLUMN {table}.{field} IS $${rendered}$$;"
@@ -447,9 +464,28 @@ def _apply_rotate_secrets(
                 skipped += 1
                 continue
             try:
+                # ir_config_parameter.value is NOT NULL in real Odoo 19
+                # (unlike the demo schema this was developed against). Use
+                # '' (cleared) instead of NULL so the UPDATE succeeds on a
+                # real schema. Semantically equivalent: the secret value is
+                # gone, the key remains so Odoo still finds the row. We keep
+                # the NULL behavior when the column allows it (matches the
+                # original demo-schema semantics and the test expectations)
+                # so this stays backward-compatible.
                 cur.execute(
-                    "UPDATE ir_config_parameter SET value = NULL "
-                    "WHERE key ~ %s",
+                    "SELECT is_nullable FROM information_schema.columns "
+                    "WHERE table_schema='public' AND table_name='ir_config_parameter' "
+                    "AND column_name='value'"
+                )
+                row = cur.fetchone()
+                # row is None when ir_config_parameter isn't in public (e.g.
+                # the anon DDL trigger relocates it to the odoo_synth schema in
+                # the test setup). Default to NULL in that case to preserve the
+                # original demo-schema behavior.
+                nullable = row is None or row[0] == "YES"
+                set_clause = "value = NULL" if nullable else "value = ''"
+                cur.execute(
+                    f"UPDATE ir_config_parameter SET {set_clause} WHERE key ~ %s",
                     (field,),
                 )
                 applied += 1
