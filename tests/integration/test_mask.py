@@ -517,15 +517,21 @@ def _seed_module_metadata(cur):
         ('some_oca_module', 'Odoo S.A.', 'installed')""")
     cur.execute("""
         CREATE TABLE ir_ui_view (
-            id serial PRIMARY KEY, key text, name text, arch_db jsonb
+            id serial PRIMARY KEY, key text, name text, arch_db jsonb,
+            arch_prev text
         )
     """)
     # Custom report template hardcodes the org name as a footer literal.
-    cur.execute("""INSERT INTO ir_ui_view (key, name, arch_db) VALUES
+    # The SAME view's arch_prev (Odoo's view-edit history) carries the same
+    # literal in its archived prior revision -- the 55_module_metadata.yml
+    # global-drop rule must null arch_prev for ALL rows.
+    cur.execute("""INSERT INTO ir_ui_view (key, name, arch_db, arch_prev) VALUES
         ('isha_darkstore.report_invoice_ds_packing_slip', 'report_invoice_ds_packing_slip',
-         '{"en_US": "<t><small>Dark Store Fulfillment - Isha Life Pvt Ltd</small></t>"}'::jsonb),
+         '{"en_US": "<t><small>Dark Store Fulfillment - Isha Life Pvt Ltd</small></t>"}'::jsonb,
+         '<t><small>Dark Store Fulfillment - Isha Life Pvt Ltd (prev revision)</small></t>'),
         ('web.some_other_view', 'some_other_view',
-         '{"en_US": "<t>do not touch me Some Other Literal</t>"}'::jsonb)""")
+         '{"en_US": "<t>do not touch me Some Other Literal</t>"}'::jsonb,
+         '<t>some unrelated prior revision</t>')""")
     return {
         "org_name": "Isha Life Pvt Ltd",
         "org_branch": "Isha Life Pvt Ltd - Tamil Nadu",
@@ -562,6 +568,15 @@ def test_module_metadata_rules_close_org_name_leaks(isolated_db):
             authors = [r[0] for r in cur.fetchall()]
             assert all(a is None for a in authors), (
                 f"ir_module_module.author not nulled globally: {authors}")
+
+            # 1b. ir_ui_view.arch_prev nulled globally -- Odoo's view-edit
+            #     history column carried the org name in the packing-slip
+            #     view's prior revision (darkstore leak-scan finding). Same
+            #     rule class as ir_module_module.author: blanket drop, all rows.
+            cur.execute("SELECT arch_prev FROM ir_ui_view ORDER BY id")
+            arch_prevs = [r[0] for r in cur.fetchall()]
+            assert all(a is None for a in arch_prevs), (
+                f"ir_ui_view.arch_prev not nulled globally: {arch_prevs}")
 
             # 2. The listed view's arch_db no longer contains the real org name,
             #    but DOES contain the masked company name (proving replace, not

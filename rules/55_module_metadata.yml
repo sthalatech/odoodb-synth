@@ -24,6 +24,24 @@ ir.module.module:
     author:               { strategy: drop, note: "Module author provenance. Null globally -- not needed in a dev copy, and the custom module's author IS the org name we're trying not to leak." }
 
 ir.ui.view:
+  fields:
+    # ir_ui_view.arch_prev holds the PREVIOUS revision of a view's arch
+    # (Odoo's view-edit history). A custom report template that hardcoded
+    # the org name in arch_db almost always has the same literal in its
+    # archived prior revision -- leak-scan proved exactly that for the
+    # isha_darkstore packing-slip view (arch_db rewritten clean, arch_prev
+    # still carried "Isha Life Pvt Ltd"). A masked dev copy has no need
+    # for view-edit history at all: nothing reads arch_prev at runtime.
+    # Null it globally -- same rule class as ir.module.module.author above.
+    arch_prev:
+      strategy: drop
+      note: >
+        View-edit history. The packing-slip view's archived prior revision
+        still carried the org name after arch_db was rewritten. Null
+        globally -- a dev copy has no functional need for view revision
+        history, and any custom template that leaked in arch_db has the
+        same literal in its arch_prev.
+
   # NOT a per-column label. ir_ui_view.arch_db holds the rendered XML for
   # EVERY view and report in the whole instance; a SECURITY LABEL on it
   # would redact every view's definition and break the app. Instead this
