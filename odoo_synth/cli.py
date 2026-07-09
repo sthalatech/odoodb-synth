@@ -66,7 +66,8 @@ def rules_validate(
     typer.secho(
         f"OK: rulebook valid -- {summary['strategies']} strategies, "
         f"{summary['field_rules']} field rules across {summary['models']} "
-        f"models in {summary['files']} files.",
+        f"models, {summary['column_patterns']} column patterns, in "
+        f"{summary['files']} files.",
         fg=typer.colors.GREEN,
     )
 
@@ -146,6 +147,16 @@ def rules_diff(
 def _print_scan_report(report: CoverageReport) -> None:
     """Human-readable findings list + summary."""
     typer.echo(report.summary())
+    if report.pattern_matches:
+        typer.echo("")
+        typer.echo(f"Covered by pattern ({len(report.pattern_matches)}):")
+        for f in report.pattern_matches:
+            fk = f" -> {f.fk_target}" if f.fk_target else ""
+            nn = " NOT NULL" if f.not_null else ""
+            typer.echo(
+                f"  {f.table}.{f.column}  [{f.shape}] {f.data_type}{nn}{fk}"
+                f"\n      {f.reason}"
+            )
     if not report.findings:
         return
     typer.echo("")
@@ -260,6 +271,8 @@ def snapshot(
     typer.secho(
         f"masked: {summary['labels_applied']} labels applied "
         f"({summary['labels_skipped']} skipped), "
+        f"{summary.get('pattern_applied', 0)} pattern labels applied "
+        f"({summary.get('pattern_skipped', 0)} skipped), "
         f"{summary['shuffle_applied']} shuffles, "
         f"{summary['rotate_applied']} rotations, "
         f"attachment rows scrubbed: {summary['attachment'].get('rows_content_dropped', 0)}",

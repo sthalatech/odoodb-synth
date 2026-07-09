@@ -1,0 +1,81 @@
+# rules/05_patterns.yml
+#
+# COLUMN-NAME PATTERN RULES -- the denormalized-cache backstop.
+#
+# Odoo caches res.partner.name / .email into many columns across many models
+# (account_move.invoice_partner_display_name, res_partner.complete_name /
+# commercial_company_name, ir_sequence.name via explicit entry, ...). Listing
+# every one per-model doesn't scale -- a real instance has 876+ undeclared
+# models, each potentially carrying a cache of a partner name. These patterns
+# match by column NAME, regardless of model, and apply a strategy.
+#
+# This is a BACKSTOP, not a substitute for reviewing what's declared:
+#   * `rules scan` still lists every pattern-matched column under
+#     "Covered by pattern" -- they are visible, not silently dropped.
+#   * A per-model field rule ALWAYS wins over a pattern. Add explicit
+#     entries for high-value models (see 10_core / 20_accounting / this
+#     file's own model entries) where you've reviewed the semantics.
+#   * Patterns are scoped by PII `shape` (free_text/partner_ref/binary) so
+#     `*_display_name` only fires on text columns, not an unrelated integer
+#     column that happens to share the suffix.
+#
+# Strategy choice: redact_freetext (not fake_company_name / fake_person_name).
+# These caches can hold a person OR a company name, and a cache field is the
+# last place you want a "realistic" fake that an operator might mistake for a
+# real record while debugging. Redaction is length-preserving and never leaks
+# a substring -- the honest default per rules/README.md's free-text section.
+# Where a cache is structurally a company name (commercial_company_name),
+# redaction still beats a fake that could collide with a real partner row.
+
+column_patterns:
+  - match: '_display_name$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      Odoo stores the partner display name on the referencing document
+      (invoice_partner_display_name on account.move, etc.). Denormalized
+      cache of res.partner.name -- the highest-leakage column family in the
+      v0.1.0 darkstore run.
+
+  - match: '_partner_name$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      Same family: a cached partner name column, by naming convention.
+
+  - match: '^display_name$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      The bare display_name cache (auditlog records, some transient models).
+      res.partner.display_name is a computed field that isn't stored, so this
+      only ever hits caches on OTHER models -- safe to redact.
+
+  - match: '^complete_name$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      Odoo's hierarchical "complete name" cache (res.partner, product.category,
+      stock.location, account.analytic.plan, stock.package). On res.partner it
+      duplicates the partner name; on the hierarchy models it embeds parent
+      names. Either way it's a name cache -- redact.
+
+  - match: '^(commercial_company_name|company_name)$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      res.partner's company-name caches. company_name is the plain field on the
+      partner's company; commercial_company_name is the legal-name cache used
+      in invoices/contacts. Both leak the org name verbatim.
+
+  - match: '_(normalized|sanitized)$'
+    strategy: redact_freetext
+    shapes: [free_text]
+    note: >
+      Odoo stores a normalized/sanitized copy of contact fields (email_normalized,
+      phone_sanitized, sanitized_acc_number). These are verbatim duplicates of
+      the PII that must be masked in lockstep with the source field. The v0.1.0
+      darkstore run found res_partner.email_normalized leaking because only email
+      was covered. Explicit rules on res.partner (10_core.yml) and res.partner.bank
+      cover the known cases; this pattern is the backstop for any other
+      *_normalized / *_sanitized copy a module adds.

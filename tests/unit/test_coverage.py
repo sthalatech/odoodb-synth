@@ -203,3 +203,113 @@ def test_schema_snapshot_roundtrips_json(snapshot):
         loaded = load_snapshot(p)
     assert set(loaded.tables) == set(snapshot.tables)
     assert loaded.tables["crm_lead"]["partner_id"].fk_target == "res_partner.id"
+
+# ---------------------------------------------------------------------------
+# column-name pattern rules (05_patterns.yml backstop)
+# ---------------------------------------------------------------------------
+
+_DUMP_WITH_CACHES = """
+CREATE TABLE account_move (
+    id serial PRIMARY KEY,
+    name character varying,
+    ref text,
+    narration text,
+    invoice_partner_display_name character varying,
+    invoice_source_email character varying
+);
+
+CREATE TABLE ir_sequence (
+    id serial PRIMARY KEY,
+    name character varying NOT NULL,
+    code character varying,
+    prefix character varying
+);
+
+CREATE TABLE x_random_model (
+    id serial PRIMARY KEY,
+    some_display_name character varying,
+    complete_name character varying,
+    invoice_partner_name character varying,
+    display_name character varying,
+    integer_display_name integer
+);
+"""
+
+
+def test_pattern_covers_display_name_caches_without_flagging():
+    rb = load_and_validate("rules/")
+    snap = snapshot_from_dump_sql(_DUMP_WITH_CACHES)
+    report = analyze(rb, snap)
+    flagged_cols = {f.column for f in report.findings
+                    if f.table == "x_random_model"}
+    assert "some_display_name" not in flagged_cols
+    assert "complete_name" not in flagged_cols
+    assert "invoice_partner_name" not in flagged_cols
+    assert "display_name" not in flagged_cols
+    # integer_display_name is shape=other -> pattern shape filter excludes it
+    assert "integer_display_name" not in flagged_cols
+    pat_cols = {f.table + "." + f.column for f in report.pattern_matches}
+    assert "x_random_model.some_display_name" in pat_cols
+    assert "x_random_model.complete_name" in pat_cols
+    assert "x_random_model.invoice_partner_name" in pat_cols
+    assert report.covered_by_pattern >= 4
+
+
+def test_explicit_field_rule_wins_over_pattern():
+    rb = load_and_validate("rules/")
+    snap = snapshot_from_dump_sql(_DUMP_WITH_CACHES)
+    report = analyze(rb, snap)
+    am_pat = [f for f in report.pattern_matches if f.table == "account_move"]
+    am_pat_cols = {f.column for f in am_pat}
+    assert "invoice_partner_display_name" not in am_pat_cols
+    assert "invoice_source_email" not in am_pat_cols
+    assert "name" not in am_pat_cols
+    assert "ref" not in am_pat_cols
+    assert "narration" not in am_pat_cols
+
+
+def test_pattern_validation_rejects_non_label_strategy():
+    import tempfile, textwrap, os
+    from odoo_synth.core.rulebook import RulebookError, load_rules, validate
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "00_strategies.yml"), "w").write(textwrap.dedent('''\
+            strategies:
+              keep: { sql_template: null }
+              redact_freetext:
+                sql_template: "MASKED WITH FUNCTION odoo_synth.redact_text({column})"
+        '''))
+        open(os.path.join(d, "05_patterns.yml"), "w").write(textwrap.dedent('''\
+            column_patterns:
+              - match: '_display_name$'
+                strategy: keep
+                shapes: [free_text]
+        '''))
+        rb = load_rules(d)
+        with pytest.raises(RulebookError):
+            validate(rb)
+
+
+def test_pattern_validation_rejects_bad_regex():
+    import tempfile, textwrap, os
+    from odoo_synth.core.rulebook import RulebookError, load_rules, validate
+    with tempfile.TemporaryDirectory() as d:
+        open(os.path.join(d, "00_strategies.yml"), "w").write(textwrap.dedent('''\
+            strategies:
+              redact_freetext:
+                sql_template: "MASKED WITH FUNCTION odoo_synth.redact_text({column})"
+        '''))
+        open(os.path.join(d, "05_patterns.yml"), "w").write(textwrap.dedent('''\
+            column_patterns:
+              - match: '[unclosed'
+                strategy: redact_freetext
+                shapes: [free_text]
+        '''))
+        rb = load_rules(d)
+        with pytest.raises(RulebookError):
+            validate(rb)
+
+
+def test_validate_directory_reports_pattern_count():
+    from odoo_synth.core.rulebook import validate_directory
+    s = validate_directory("rules/")
+    assert s["column_patterns"] >= 5

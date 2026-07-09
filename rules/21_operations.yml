@@ -1,0 +1,69 @@
+# rules/21_operations.yml
+#
+# Explicit coverage for high-value operational models the v0.1.0 darkstore
+# run found leaking partner names / emails via denormalized caches. These
+# are reviewed entries (not pattern backstops) -- the field list comes from
+# the actual isha schema, not a guess. Pattern rules in 05_patterns.yml
+# already catch the *_display_name / complete_name families generically; the
+# entries here cover model-specific free-text that doesn't follow a cache
+# naming convention (ir_sequence.name, stock_move.origin, etc.).
+
+account.journal:
+  fields:
+    # incoming_einvoice_notification_email: an email address for invoice
+    # arrival notifications -- real PII, fake it.
+    incoming_einvoice_notification_email: { strategy: fake_email }
+    # access_token: a bearer token for the journal's report endpoint --
+    # secret hygiene, rotate is overkill; drop the value.
+    access_token:           { strategy: drop }
+    # code/type/state/etc are structural; bank_statements_source is config;
+    # invoice_reference_type/model are enum-like. Leave them.
+    ref:                    { strategy: keep, note: "Journal code reference (INV/BILL/...); operational." }
+
+stock.move:
+  fields:
+    # origin: the source document reference (PO/SO number) -- operational,
+    # keep. description_picking_manual: free-text typed by a warehouse user
+    # on a picking line -- can carry a note a user typed about a customer.
+    description_picking_manual: { strategy: redact_freetext }
+    # origin, reference, inventory_name, next_serial: operational references
+    # and serial numbers -- left alone (real serial numbers are not PII and
+    # are exactly what you want realistic for stock test data).
+    # partner_id / restrict_partner_id: a FK to res.partner -- the partner
+    # row is what's masked (10_core.yml); the pointer is structural, leave it.
+
+stock.picking:
+  fields:
+    note:                  { strategy: redact_freetext, note: "Free-text delivery note; a user can type customer instructions here." }
+    # carrier_tracking_ref: a courier tracking number -- operational, keep.
+    # name/origin: document references -- operational, keep.
+
+ir.sequence:
+  fields:
+    # name embeds the company/sequence name ("Isha Life Pvt Ltd Sequence
+    # scrap") -- the darkstore run found ir_sequence leaking 10 rows via
+    # this. Redact; the prefix/suffix/code stay (they're the actual format
+    # template the sequence uses, operational).
+    name:                  { strategy: redact_freetext }
+
+res.bank:
+  fields:
+    # A bank's own contact details -- not customer PII, but real org contact
+    # info. fake_email/phone keep the shape; street/city/zip/bic are the
+    # bank's address + BIC -- BIC is public reference data (leave it), the
+    # address is the bank's, not a customer's, so we keep it too. Only the
+    # contact channels (email/phone) are worth faking for realism.
+    email:                 { strategy: fake_email }
+    phone:                 { strategy: fake_phone }
+    # name/street/zip/city/bic: the bank's own identity, public reference
+    # data, leave it -- masking a bank's registered address helps nothing
+    # and breaks payment-routing test data.
+
+sale.order.line:
+  fields:
+    # name: the line description, often the product name but a sales user can
+    # type a free-text line ("custom engraving: John Smith 555-1234"). Redact.
+    name:                  { strategy: redact_freetext }
+    # order_partner_id: FK to res.partner -- structural pointer, leave it
+    # (the partner row is what's masked). state/display_type/invoice_status:
+    # operational enums, leave them.

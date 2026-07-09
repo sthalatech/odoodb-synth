@@ -14,13 +14,48 @@ and so reviewers can find things by app area:
 | File | Covers |
 |---|---|
 | `00_strategies.yml` | The masking-strategy vocabulary. Read this first — everything else just assigns strategies from here to fields. |
+| `05_patterns.yml` | Column-name pattern backstop (denormalized cache fields) — see "Pattern rules" below. Loaded before per-model files. |
 | `10_core.yml` | `res.partner`, `res.users`, `res.company`, bank accounts |
 | `20_accounting.yml` | Invoices, payments, payment tokens/providers |
+| `21_operations.yml` | High-value operational models (`account.journal`, `stock.move`/`stock.picking`, `ir.sequence`, `res.bank`, `sale.order.line`) — explicit reviewed entries, not pattern-matched |
 | `30_hr.yml` | Employees, contracts, recruitment |
 | `40_messaging.yml` | Chatter, mail, activities, calendar — the free-text problem lives here |
 | `50_attachments.yml` | Binary file policy (not per-field, per-model) |
 | `60_system_secrets.yml` | API keys, SMTP credentials, signing secrets — security hygiene, not PII |
 | `70_sales_crm_website.yml` | Leads, orders, newsletter lists, surveys |
+
+## Pattern rules (the denormalized-cache backstop)
+
+`05_patterns.yml` adds a `column_patterns:` list: rules that match by
+column **name** regex regardless of model, scoped by PII shape, and apply
+a strategy. This exists because Odoo denormalizes `res.partner.name` /
+`.email` into dozens of cache columns across hundreds of models
+(`account_move.invoice_partner_display_name`,
+`res_partner.complete_name`/`commercial_company_name`, `ir_sequence.name`,
+...) — listing every one per-model doesn't scale, and the v0.1.0 darkstore
+run confirmed these caches are the #1 leak surface.
+
+Pattern rules are a **backstop, not a substitute for reviewing what's
+declared**:
+
+* `rules scan` lists every pattern-matched column under **"Covered by
+  pattern"** — they are visible in the report, not silently dropped. You
+  can see exactly what a pattern caught and audit it.
+* A per-model field rule **always wins** over a pattern. Add explicit
+  entries (like `21_operations.yml`) for high-value models whose field
+  semantics you've actually reviewed; the pattern only catches what no
+  explicit rule covers.
+* Patterns are scoped by `shapes:` (`free_text`, `partner_ref`, `binary`)
+  so a suffix like `_display_name` only fires on text columns, not an
+  unrelated integer column that happens to share the name.
+
+The shipped patterns use `redact_freetext`, not a `fake_*` strategy:
+a cache field can hold a person OR a company name, and redaction is
+length-preserving and never leaks a substring — the honest default per
+the "free-text problem" section above. Where a cache is reviewed and
+structurally known (e.g. an explicit `account.move` entry), a `fake_*`
+strategy is fine; patterns are for the unreviewed 876+ models.
+
 
 ## The free-text problem (read this before trusting any redact_freetext rule)
 

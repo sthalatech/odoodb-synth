@@ -11,9 +11,19 @@ account.move:
   fields:
     ref:                  { strategy: redact_freetext, note: "Free-text customer reference — invoices routinely carry a customer's own PO number or a typed note here." }
     narration:             { strategy: redact_freetext }
-    # partner_id, invoice line amounts, dates, numbering: left alone —
-    # not PII, and the numbers/dates are usually exactly what you want
-    # realistic for testing reports and reconciliation logic.
+    # Denormalized partner-name/email caches that the v0.1.0 darkstore run
+    # found leaking (account_move: 44 rows). invoice_partner_display_name is
+    # the cached partner display name on every invoice; invoice_source_email
+    # is the captured sender address on inbound vendor bills. name is the
+    # move's own sequence number (e.g. INV/26-27/0012) -- kept, it's an
+    # operational reference, not PII.
+    invoice_partner_display_name: { strategy: redact_freetext }
+    invoice_source_email:  { strategy: fake_email }
+    name:                 { strategy: keep, note: "Sequence number reference (INV/2024/0001); operational, not PII, and needed for report reconciliation." }
+    payment_reference:    { strategy: keep, note: "Customer-facing payment reference; partial masking would break payment matching in test data." }
+    # partner_id, commercial_partner_id, invoice line amounts, dates,
+    # numbering: left alone -- not PII, and the numbers/dates are usually
+    # exactly what you want realistic for testing reports and reconciliation.
 
 account.move.line:
   fields:

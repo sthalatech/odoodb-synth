@@ -7,8 +7,13 @@
 res.partner:
   fields:
     name:                { strategy: fake_person_name, note: "Applies to both companies and individuals; fake_company_name reads oddly on person records but is functionally harmless. Split on is_company if you want it cosmetically correct." }
+    complete_name:       { strategy: redact_freetext, note: "Hierarchical display-name cache (parent/child). A verbatim duplicate of name (+ parent names); masked here explicitly so it doesn't rely on the 05_patterns.yml backstop." }
+    commercial_company_name: { strategy: redact_freetext, note: "Cached legal company name used in invoices/contacts." }
+    company_name:        { strategy: redact_freetext, note: "Cached company name on the partner's company field." }
     email:                { strategy: fake_email }
+    email_normalized:    { strategy: fake_email, note: "Odoo's normalized (lowercased, stripped) copy of email -- a verbatim duplicate of the PII that must be masked in lockstep with email, exactly like sanitized_acc_number on res.partner.bank. The v0.1.0 darkstore run found this leaking because only email was covered." }
     phone:                { strategy: fake_phone }
+    phone_sanitized:      { strategy: fake_phone, note: "Normalized phone (digits only). Same lockstep rule as email_normalized." }
     mobile:               { strategy: fake_phone }
     street:               { strategy: fake_street_address }
     street2:              { strategy: drop }

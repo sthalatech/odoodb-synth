@@ -47,14 +47,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Iterable
 
-from .rulebook import Rulebook
+from .rulebook import ColumnPattern, Rulebook
 from .schema import ColumnInfo, SchemaSnapshot
 
 
 # Tables a partner_ref FK points into. The FK target's "model name" is the
 # table with underscores; res_partner is the only one by default, but an
 # instance with custom partner-like tables could extend this.
+import re as _re
+
 _PARTNER_TABLES = {"res_partner"}
+
+
+def match_column_pattern(
+    column: str, shape: str, patterns
+) -> "ColumnPattern | None":
+    """Return the first pattern whose regex matches `column` and whose
+    `shapes` filter (if non-empty) includes `shape`.
+
+    Patterns are checked in file/declaration order; the first match wins.
+    A pattern with empty `shapes` matches any shape. Callers check explicit
+    field rules BEFORE patterns, so an explicit per-model rule always wins.
+    """
+    for pat in patterns:
+        if pat.shapes and shape not in pat.shapes:
+            continue
+        if _re.search(pat.match, column):
+            return pat
+    return None
 
 
 @dataclass
@@ -72,6 +92,8 @@ class Finding:
 class CoverageReport:
     findings: list[Finding] = field(default_factory=list)
     covered_columns: int = 0
+    covered_by_pattern: int = 0
+    pattern_matches: list[Finding] = field(default_factory=list)
     considered_columns: int = 0
     undeclared_models: list[str] = field(default_factory=list)
     unparsed_tables: list[str] = field(default_factory=list)
@@ -84,6 +106,7 @@ class CoverageReport:
         lines = [
             f"considered {self.considered_columns} columns, "
             f"{self.covered_columns} covered by the rulebook, "
+            f"{self.covered_by_pattern} covered by pattern, "
             f"{len(self.findings)} flagged.",
         ]
         if self.undeclared_models:
@@ -190,6 +213,22 @@ def analyze(rulebook: Rulebook, snapshot: SchemaSnapshot,
             if (model, colname) in covered:
                 report.covered_columns += 1
                 continue  # explicitly handled (incl. keep)
+            # Backstop: column-name patterns. Checked AFTER explicit field
+            # rules so a per-model rule always wins. A pattern match counts
+            # as coverage (not flagged) but is surfaced in the report as a
+            # "covered by pattern" entry, not silently dropped -- per
+            # rules/README.md a matched pattern should still be visible.
+            pat = match_column_pattern(colname, shape, rulebook.column_patterns)
+            if pat is not None:
+                report.covered_by_pattern += 1
+                report.pattern_matches.append(Finding(
+                    table=table, column=colname, shape=shape,
+                    data_type=ci.data_type,
+                    reason=f"covered by pattern `match: {pat.match}` "
+                           f"-> {pat.strategy}",
+                    fk_target=ci.fk_target, not_null=ci.not_null,
+                ))
+                continue
             if not model_declared:
                 # The whole model is undeclared. Flag the PII-shaped columns
                 # and record the model once for the undeclared-models summary.
@@ -217,5 +256,6 @@ def analyze(rulebook: Rulebook, snapshot: SchemaSnapshot,
                 ))
     # Sort findings for stable output / CI diffs.
     report.findings.sort(key=lambda f: (f.table, f.column))
+    report.pattern_matches.sort(key=lambda f: (f.table, f.column))
     report.undeclared_models.sort()
     return report

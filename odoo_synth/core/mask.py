@@ -49,6 +49,7 @@ from typing import Any, Iterable
 import psycopg
 
 from .rulebook import Rulebook
+from .coverage import classify_shape, match_column_pattern
 
 # ---------------------------------------------------------------------------
 
@@ -229,6 +230,125 @@ def build_plan(rulebook: Rulebook) -> MaskPlan:
     )
 
 
+def _read_app_columns(cur) -> list[tuple[str, str, str, str | None]]:
+    """Read (schema, table, column, data_type, fk_target) for every column in
+    every app schema (public + odoo_synth) from the live scratch catalogs.
+
+    The anon extension installs a DDL event trigger that can relocate
+    newly-created tables into the odoo_synth schema; real Odoo tables
+    restored from a dump stay in public. Reading both (and excluding only
+    system schemas + the anon faker-dictionary tables) means the pattern
+    backstop sees the same columns `rules scan` would, regardless of which
+    schema they landed in. fk_target is resolved from pg_constraint.
+    """
+    cur.execute(
+        "SELECT n.nspname, c.relname, a.attname, "
+        "format_type(a.atttypid, a.atttypmod) "
+        "FROM pg_class c "
+        "JOIN pg_namespace n ON c.relnamespace=n.oid "
+        "JOIN pg_attribute a ON a.attrelid=c.oid "
+        "WHERE c.relkind='r' AND a.attnum>0 AND NOT a.attisdropped "
+        "AND n.nspname IN ('public','odoo_synth') "
+        "ORDER BY n.nspname, c.relname, a.attnum"
+    )
+    base = cur.fetchall()  # (nsp, tbl, col, dtype)
+    # Resolve FK targets for partner_ref classification.
+    cur.execute(
+        "SELECT conrelid::regclass::text, confrelid::regclass::text, "
+        "conkey, confkey FROM pg_constraint WHERE contype='f'"
+    )
+    fk_map: dict[tuple[str, str], str] = {}  # (tbl, col) -> "fktbl.col"
+    for conrel, confrel, conkey, confkey in cur.fetchall():
+        tbl = conrel.split(".")[-1].strip('"')
+        fktbl = confrel.split(".")[-1].strip('"') if confrel else None
+        if not fktbl:
+            continue
+        # map local attnum -> local colname
+        with cur.connection.cursor() as c2:
+            c2.execute(
+                "SELECT attname, attnum FROM pg_attribute "
+                "WHERE attrelid=%s::regclass AND attnum=ANY(%s)",
+                (conrel, list(conkey or [])),
+            )
+            local = {num: name for name, num in c2.fetchall()}
+        with cur.connection.cursor() as c2:
+            c2.execute(
+                "SELECT attname, attnum FROM pg_attribute "
+                "WHERE attrelid=%s::regclass AND attnum=ANY(%s)",
+                (confrel, list(confkey or [])),
+            )
+            ref = {num: name for name, num in c2.fetchall()}
+        for i, lnum in enumerate(conkey or []):
+            lname = local.get(lnum)
+            rnum = (confkey or [None])[i] if i < len(confkey or []) else None
+            rname = ref.get(rnum) if rnum else None
+            if lname and rname:
+                fk_map[(tbl, lname)] = f"{fktbl}.{rname}"
+    out = []
+    for nsp, tbl, col, dtype in base:
+        out.append((tbl, col, dtype or "", fk_map.get((tbl, col))))
+    return out
+
+
+def build_pattern_labels_rows(
+    rulebook: Rulebook, rows: list[tuple[str, str, str, str | None]]
+) -> tuple[list[str], int, int]:
+    """Generate SECURITY LABEL statements for columns matching a rulebook
+    column-name pattern but not already covered by an explicit field rule.
+
+    Masking-side counterpart to coverage.match_column_pattern(): where
+    `rules scan` *counts* pattern-covered columns (visible, not flagged),
+    masking *applies* a real anon label to each so the denormalized caches
+    (account_move.invoice_partner_display_name, res_partner.complete_name,
+    ir_sequence.name, ...) actually get masked.
+
+    An explicit per-model field rule always wins: skip any (model, col)
+    pair already in rulebook.field_rules. Returns (label_statements, matched,
+    skipped_implicit) -- implicit_skipped counts columns a pattern would have
+    matched but an explicit rule already covered (overlap visibility).
+    """
+    from .schema import ColumnInfo
+    from .coverage import _build_table_model_index, _table_to_model
+    labels: list[str] = []
+    matched = 0
+    implicit_skipped = 0
+    explicit = set(rulebook.field_rules.keys())
+    table_index = _build_table_model_index(rulebook)
+    for tbl, col, dtype, fk in rows:
+        model = _table_to_model(tbl, table_index)
+        if (model, col) in explicit:
+            implicit_skipped += 1
+            continue
+        ci = ColumnInfo(name=col, data_type=dtype, fk_target=fk)
+        shape = classify_shape(ci)
+        pat = match_column_pattern(col, shape, rulebook.column_patterns)
+        if pat is None:
+            continue
+        strat = rulebook.strategies.get(pat.strategy)
+        if strat is None or strat.sql_template is None:
+            continue  # validate() guards this; defensive skip.
+        matched += 1
+        labels.append(render_label(model, col, strat.sql_template))
+    return labels, matched, implicit_skipped
+
+
+def build_pattern_labels(rulebook: Rulebook, snapshot) -> tuple[list[str], int, int]:
+    """Convenience wrapper for callers that already hold a SchemaSnapshot
+    (e.g. tests). The masking pipeline uses build_pattern_labels_rows +
+    _read_app_columns instead, to be schema-relocation-robust."""
+    from .coverage import _build_table_model_index, _table_to_model
+    labels: list[str] = []
+    matched = 0
+    implicit_skipped = 0
+    explicit = set(rulebook.field_rules.keys())
+    table_index = _build_table_model_index(rulebook)
+    rows = []
+    for tbl, cols in snapshot.tables.items():
+        for col, ci in cols.items():
+            rows.append((tbl, col, ci.data_type, ci.fk_target))
+    return build_pattern_labels_rows(rulebook, rows)
+
+
 # ---------------------------------------------------------------------------
 # Attachment policy (rules/50_attachments.yml)
 # ---------------------------------------------------------------------------
@@ -320,8 +440,30 @@ def apply_masking(scratch_db_url: str, rulebook: Rulebook) -> dict[str, Any]:
             # 0. Trust the odoo_synth schema so anon accepts our funcs.
             cur.execute("SECURITY LABEL FOR anon ON SCHEMA odoo_synth IS 'TRUSTED';")
 
-            # 1. Per-column labels.
+            # 1. Per-column labels (explicit per-model field rules).
             labels_applied, labels_skipped = _exec_script(cur, plan.label_statements)
+
+            # 1b. Column-name pattern labels (the denormalized-cache backstop).
+            # Patterns apply to columns the explicit rules don't cover (e.g.
+            # account_move.invoice_partner_display_name, ir_sequence.name).
+            # We read the columns from the catalogs across ALL app schemas
+            # (public + odoo_synth -- the anon DDL event trigger can relocate
+            # newly-created tables to odoo_synth, so a public-only read would
+            # miss them). Real restored-from-dump Odoo tables stay in public.
+            pattern_labels: list[str] = []
+            pattern_applied = 0
+            pattern_skipped = 0
+            if rulebook.column_patterns:
+                try:
+                    cols_rows = _read_app_columns(cur)
+                except Exception as exc:  # pragma: no cover - catalog read
+                    raise MaskError(
+                        f"pattern-label schema read failed: {exc}"
+                    ) from exc
+                pattern_labels, _matched, _impl = build_pattern_labels_rows(
+                    rulebook, cols_rows)
+                pattern_applied, pattern_skipped = _exec_script(
+                    cur, pattern_labels)
 
             # 2. Apply.
             cur.execute("SELECT anon.anonymize_database();")
@@ -380,6 +522,9 @@ def apply_masking(scratch_db_url: str, rulebook: Rulebook) -> dict[str, Any]:
     return {
         "labels_applied": labels_applied,
         "labels_skipped": labels_skipped,
+        "pattern_labels": len(pattern_labels) if rulebook.column_patterns else 0,
+        "pattern_applied": pattern_applied,
+        "pattern_skipped": pattern_skipped,
         "anonymize_database": anon_result,
         "shuffle_applied": shuffle_applied,
         "shuffle_skipped": shuffle_skipped,

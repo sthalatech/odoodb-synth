@@ -143,6 +143,7 @@ def _restore_db_url(db_url: str) -> str:
 
 
 def _pg_restore(bundle: Path, cfg: ProvisionConfig) -> None:
+    import os
     dump = bundle / "db.dump"
     if not dump.exists():
         raise ProvisionError(
@@ -151,24 +152,46 @@ def _pg_restore(bundle: Path, cfg: ProvisionConfig) -> None:
         )
     # Pipe the dump to pg_restore's stdin so it works through `docker exec`
     # redirects (the dump file is on the host, pg_restore may be in-container).
+    # Restore into the TARGET DB (not the admin/maintenance DB -- cfg.db_url
+    # points at `postgres` so CREATE DATABASE works; the restore must land in
+    # cfg.db_name).
+    target_url = _target_db_url(cfg.db_url, cfg.db_name)
+    # ODOO_SYNTH_RESTORE_DB_URL override: when the restore binary runs in a
+    # container (host pg_restore too old for the server major), the in-
+    # container DB URL differs from the host URL. The override may contain a
+    # literal {dbname} placeholder substituted with the target DB name, so a
+    # single env var works for any target DB (the target name is dynamic, so a
+    # static URL can't point at it). Without the placeholder the override is
+    # used as-is (back-compat with the existing ODOO_SYNTH_RESTORE_DB_URL form
+    # used elsewhere -- though those callers restore into a fixed DB).
+    override = os.environ.get("ODOO_SYNTH_RESTORE_DB_URL")
+    if override:
+        restore_url = override.replace("{dbname}", cfg.db_name)
+    else:
+        restore_url = target_url
     proc = subprocess.run(
-        _pg_restore_binary() + ["-d", _restore_db_url(cfg.db_url),
+        _pg_restore_binary() + ["-d", restore_url,
                                  "--no-owner", "--no-privileges",
                                  "--clean", "--if-exists"],
         stdin=open(dump, "rb"), capture_output=True, text=True,
     )
     # pg_restore --clean emits benign "does not exist" notices on a fresh DB;
-    # verify data actually loaded rather than trusting the return code.
+    # verify data actually loaded into the TARGET DB (not the admin DB) rather
+    # than trusting the return code. Connecting to target_url is the fix for
+    # the bug where the verify checked the maintenance DB and passed vacuously
+    # while the restore had silently dumped into `postgres`.
     import psycopg
-    with psycopg.connect(cfg.db_url, autocommit=True) as chk:
+    with psycopg.connect(target_url, autocommit=True) as chk:
         with chk.cursor() as c:
             c.execute("SELECT to_regclass('public.res_partner') IS NOT NULL OR "
                       "to_regclass('public.ir_config_parameter') IS NOT NULL")
             loaded = c.fetchone()[0]
     if not loaded:
         raise ProvisionError(
-            f"pg_restore did not load data into {cfg.db_url}. "
-            f"stderr: {proc.stderr}"
+            f"pg_restore did not load data into {target_url} "
+            f"(db_name={cfg.db_name}). The admin URL was {cfg.db_url}; "
+            f"check that ODOO_SYNTH_RESTORE_DB_URL (if set) points at the "
+            f"target DB, not the maintenance DB. stderr: {proc.stderr}"
         )
 
 
@@ -183,7 +206,8 @@ def _manual_neutralize(cfg: ProvisionConfig) -> None:
     the operational layer on top.
     """
     import psycopg
-    with psycopg.connect(cfg.db_url, autocommit=True) as conn:
+    target_url = _target_db_url(cfg.db_url, cfg.db_name)
+    with psycopg.connect(target_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             # Only touch tables that exist (the masked DB may not have every
             # Odoo table if modules aren't installed).
@@ -238,7 +262,8 @@ def _verify_credentials_scrubbed(cfg: ProvisionConfig, rulebook: Rulebook | None
     """
     import psycopg
     res: dict[str, Any] = {"checks": {}, "passed": True}
-    with psycopg.connect(cfg.db_url, autocommit=True) as conn:
+    target_url = _target_db_url(cfg.db_url, cfg.db_name)
+    with psycopg.connect(target_url, autocommit=True) as conn:
         with conn.cursor() as cur:
             def _q(sql, missing_ok=True):
                 try:
@@ -248,6 +273,21 @@ def _verify_credentials_scrubbed(cfg: ProvisionConfig, rulebook: Rulebook | None
                     if missing_ok and "does not exist" in str(exc).lower():
                         return None
                     raise
+
+            # Guardrail: the target DB must actually have Odoo tables loaded.
+            # If the restore silently dumped into the maintenance DB (the
+            # cfg.db_url-vs-target bug this check now catches), every
+            # credential table is absent and the per-table checks below pass
+            # VACUOUSLY (missing_ok=True -> None -> pass). A 0-table target
+            # must FAIL verify, not pass. This is what hid the first
+            # real-schema provisioning bug on darkstore.
+            cur.execute(
+                "SELECT count(*) FROM pg_class c "
+                "JOIN pg_namespace n ON c.relnamespace=n.oid "
+                "WHERE c.relkind='r' AND n.nspname='public'"
+            )
+            public_tables = cur.fetchone()[0]
+            res["checks"]["target_db_has_tables"] = public_tables > 0
 
             # database.secret / database.uuid present + non-null.
             row = _q("SELECT value FROM ir_config_parameter WHERE key='database.secret'")
@@ -318,3 +358,18 @@ def _admin_url(db_url: str, db_name: str) -> str:
         base = db_url.rsplit("/", 1)[0]
         return base + "/postgres"
     return db_url + "/postgres"
+
+
+def _target_db_url(db_url: str, db_name: str) -> str:
+    """The URL of the freshly-created target DB (admin URL base + /<db_name>).
+
+    cfg.db_url is the ADMIN URL (points at the maintenance DB so we can
+    CREATE DATABASE); the restore, manual-neutralize, and credential-verify
+    steps must connect to the TARGET DB, not the maintenance DB. Restoring
+    into the admin URL would dump Odoo's tables into the `postgres` DB -- a
+    real bug found by the first real-schema provisioning run on darkstore.
+    """
+    if "/" in db_url.rsplit("@", 1)[-1]:
+        base = db_url.rsplit("/", 1)[0]
+        return f"{base}/{db_name}"
+    return f"{db_url}/{db_name}"

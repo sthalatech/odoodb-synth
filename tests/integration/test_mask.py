@@ -385,3 +385,96 @@ def test_leak_scan_catches_unmasked_values(isolated_db):
     with psycopg.connect(isolated_db, autocommit=True) as conn:
         with conn.cursor() as cur:
             cur.execute("DROP TABLE IF EXISTS leak_canary CASCADE")
+
+
+# ---------------------------------------------------------------------------
+# Column-name pattern masking (05_patterns.yml backstop)
+# ---------------------------------------------------------------------------
+
+_PATTERN_SEED_TABLES = ["res_partner", "account_move", "x_random_doc"]
+
+
+def _seed_pattern(cur):
+    """Seed an undeclared model x_random_doc with a *_display_name cache of a
+    partner name, plus account_move (declared) whose invoice_partner_display_name
+    is covered by an EXPLICIT rule (not the pattern). Verifies the pattern
+    backstop masks the undeclared cache, and the explicit rule wins on the
+    declared model."""
+    for tbl in _PATTERN_SEED_TABLES:
+        cur.execute(f'DROP TABLE IF EXISTS "{tbl}" CASCADE')
+    cur.execute("""
+        CREATE TABLE res_partner (
+            id serial PRIMARY KEY, name text, email text
+        )
+    """)
+    cur.execute("INSERT INTO res_partner (name,email) VALUES "
+                "('Real Company Inc','real@company-real.com')")
+    # account_move: declared in 20_accounting.yml. invoice_partner_display_name
+    # has an EXPLICIT redact_freetext rule -- must be masked by the explicit
+    # label, and must NOT appear as a pattern label (explicit wins).
+    cur.execute("""
+        CREATE TABLE account_move (
+            id serial PRIMARY KEY, name text, ref text, narration text,
+            invoice_partner_display_name text, invoice_source_email text
+        )
+    """)
+    cur.execute("INSERT INTO account_move (name, ref, narration, "
+                "invoice_partner_display_name, invoice_source_email) VALUES "
+                "('INV/2024/0001', 'PO-12345', 'billing note', "
+                "'Real Company Inc', 'vendor@company-real.com')")
+    # x_random_doc: UNDECLARED model carrying a *_display_name cache. Only the
+    # pattern backstop can mask this -- no explicit rule exists for it.
+    cur.execute("""
+        CREATE TABLE x_random_doc (
+            id serial PRIMARY KEY,
+            some_display_name text,
+            complete_name text,
+            ref text
+        )
+    """)
+    cur.execute("INSERT INTO x_random_doc (some_display_name, complete_name, ref) "
+                "VALUES ('Real Company Inc', 'Real Company Inc - child', 'note')")
+    return {"cache_name": "Real Company Inc",
+            "cache_complete": "Real Company Inc - child",
+            "vendor_email": "vendor@company-real.com"}
+
+
+def test_pattern_labels_mask_undeclared_cache_columns(isolated_db):
+    """The 05_patterns.yml backstop must mask *_display_name / complete_name
+    cache columns on UNDECLARED models (where no explicit field rule exists),
+    closing the denormalized-cache leak the v0.1.0 darkstore run found."""
+    from odoo_synth.core.rulebook import load_and_validate
+    from odoo_synth.core.mask import apply_masking, leak_scan
+    import psycopg
+
+    rb = load_and_validate(RULES_DIR)
+    assert rb.column_patterns, "rulebook must ship column patterns"
+
+    with psycopg.connect(isolated_db, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            originals = _seed_pattern(cur)
+
+    summary = apply_masking(isolated_db, rb)
+    # Pattern labels must have run.
+    assert summary["pattern_labels"] > 0, "no pattern labels generated"
+    assert summary["pattern_applied"] > 0, "pattern labels not applied"
+    # Leak scan: the cache values must be gone.
+    leaks = leak_scan(isolated_db, list(originals.values()))
+    assert leaks == [], f"pattern backstop leaked: {leaks}"
+
+    # Explicit-rule-wins: account_move.invoice_partner_display_name is covered
+    # by an explicit rule, so it must not be counted in pattern_applied as a
+    # pattern hit. We check the masked value is redacted (not the original) and
+    # the column was handled (it's masked -- explicit rule applied).
+    with psycopg.connect(isolated_db, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT invoice_partner_display_name, invoice_source_email "
+                        "FROM account_move WHERE id=1")
+            am_name, am_email = cur.fetchone()
+            assert am_name != "Real Company Inc", "explicit rule didn't mask"
+            assert "@company-real.com" not in (am_email or ""), "email leaked"
+            # x_random_doc cache columns must be redacted, not the originals.
+            cur.execute("SELECT some_display_name, complete_name FROM x_random_doc")
+            rows = cur.fetchall()
+            assert all(r[0] != "Real Company Inc" for r in rows), "pattern missed cache"
+            assert all(r[1] != "Real Company Inc - child" for r in rows), "pattern missed complete_name"

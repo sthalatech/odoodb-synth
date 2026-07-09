@@ -93,4 +93,4 @@ jobs:
       - name: Integration tests (mask + CLI round-trip + rules scan, postgres-anon only)
         env:
           SCRATCH_DB_URL: postgresql://odoo_synth:odoo_synth@localhost:5432/scratch
-        run: pytest tests/integration/test_mask.py tests/integration/test_snapshot_cli.py tests/integration/test_scan_cli.py -v
+        run: pytest tests/integration/test_mask.py tests/integration/test_snapshot_cli.py tests/integration/test_scan_cli.py tests/integration/test_provision_fallback.py -v

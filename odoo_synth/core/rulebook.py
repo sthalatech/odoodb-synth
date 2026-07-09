@@ -54,9 +54,37 @@ class FieldRule:
 
 
 @dataclass
+class ColumnPattern:
+    """A column-name pattern rule (the denormalized-cache backstop).
+
+    Odoo caches res.partner.name / .email into many denormalized columns
+    across many models (account_move.invoice_partner_display_name,
+    res_partner.complete_name/commercial_company_name, ir_sequence.name,
+    ...). Listing every one per-model doesn't scale -- 876 undeclared
+    models in a real instance. A column-name pattern matches by column
+    *name* regex, regardless of model, and applies a strategy.
+
+    This is a BACKSTOP, not a substitute for reviewing what's declared:
+    pattern-matched columns show up in `rules scan` output as
+    "covered by pattern" (not silently dropped), and a per-model field rule
+    always wins over a pattern. Patterns are also scoped by PII `shape`
+    (free_text/partner_ref/binary) so a pattern like `*_display_name` only
+    fires on text columns, not on an unrelated integer column that happens
+    to share the suffix.
+    """
+    match: str            # regex matched against the column NAME
+    strategy: str
+    shapes: tuple[str, ...] = ()   # empty == all shapes
+    note: str = ""
+    file: str = ""
+    line: int = 0
+
+
+@dataclass
 class Rulebook:
     strategies: dict[str, Strategy] = field(default_factory=dict)
     field_rules: dict[tuple[str, str], FieldRule] = field(default_factory=dict)
+    column_patterns: list[ColumnPattern] = field(default_factory=list)
     # raw parsed documents keyed by filename, for callers (scan/diff) that
     # need the full structure beyond field strategies.
     raw: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -163,7 +191,7 @@ def load_rules(rules_dir: str | Path) -> Rulebook:
             line=doc_line,
         )
 
-    # Second pass: load every other file and collect field rules.
+    # Second pass: load every other file and collect field rules + patterns.
     for f in files:
         if f.name == _STRATEGIES_FILE:
             continue
@@ -174,9 +202,35 @@ def load_rules(rules_dir: str | Path) -> Rulebook:
                 f"{f.name}: top-level YAML must be a mapping, got "
                 f"{type(data).__name__}"
             )
+        # File-level column_patterns: list (backstop rules; see ColumnPattern).
+        # Loaded before per-model entries so an explicit field rule always wins.
+        patterns = data.get("column_patterns")
+        if patterns is not None:
+            if not isinstance(patterns, list):
+                raise RulebookError(
+                    f"{f.name}: `column_patterns:` must be a list, got "
+                    f"{type(patterns).__name__}"
+                )
+            for p in patterns:
+                if not isinstance(p, dict) or "match" not in p or "strategy" not in p:
+                    raise RulebookError(
+                        f"{f.name}: each column_patterns entry needs `match` "
+                        f"(regex) and `strategy`; got {p!r}"
+                    )
+                shapes = p.get("shapes") or ()
+                if isinstance(shapes, str):
+                    shapes = (shapes,)
+                rb.column_patterns.append(ColumnPattern(
+                    match=str(p["match"]),
+                    strategy=str(p["strategy"]),
+                    shapes=tuple(str(s) for s in shapes),
+                    note=str(p.get("note", "") or ""),
+                    file=f.name, line=doc_line,
+                ))
         for model_name, model_def in data.items():
-            # Some keys are file-level metadata (e.g. `note:`, `default_policy:`)
-            # -- skip anything that isn't a model mapping with a `fields:` key.
+            # Some keys are file-level metadata (e.g. `note:`, `default_policy:`,
+            # `column_patterns:`) -- skip anything that isn't a model mapping
+            # with a `fields:` key.
             if not isinstance(model_def, dict):
                 continue
             fields = model_def.get("fields")
@@ -239,6 +293,35 @@ def validate(rb: Rulebook) -> None:
                 f"`{fr.strategy}` -- not defined under `strategies:` in "
                 f"{_STRATEGIES_FILE}. Known strategies: "
                 f"{', '.join(sorted(known))}"
+            )
+
+    # 1b. Column patterns: strategy must exist, regex must compile, and
+    #     the strategy must be a per-column label strategy (sql_template
+    #     non-null) -- patterns can't be keep/shuffle/rotate because a
+    #     pattern match has no single (model,field) to anchor those to.
+    import re as _re
+    for pat in rb.column_patterns:
+        if pat.strategy not in known:
+            raise RulebookError(
+                f"{pat.file}: column_patterns entry `match: {pat.match}` "
+                f"references unknown strategy `{pat.strategy}` -- not defined "
+                f"under `strategies:` in {_STRATEGIES_FILE}."
+            )
+        try:
+            _re.compile(pat.match)
+        except _re.error as exc:
+            raise RulebookError(
+                f"{pat.file}: column_patterns `match: {pat.match}` is not a "
+                f"valid Python regex: {exc}"
+            ) from exc
+        strat = rb.strategies.get(pat.strategy)
+        if strat is None or strat.sql_template is None:
+            raise RulebookError(
+                f"{pat.file}: column_patterns `match: {pat.match}` uses "
+                f"strategy `{pat.strategy}` which has no sql_template -- "
+                "patterns must be a per-column label strategy (e.g. "
+                "redact_freetext, fake_email). keep/shuffle/rotate are not "
+                "valid for patterns."
             )
 
     # 2. No model.field declared twice with different strategies.
@@ -326,5 +409,6 @@ def validate_directory(rules_dir: str | Path) -> dict[str, Any]:
         "strategies": len(rb.strategies),
         "field_rules": len(rb.field_rules),
         "models": len({m for (m, _) in rb.field_rules}),
+        "column_patterns": len(rb.column_patterns),
         "files": len(rb.raw),
     }
