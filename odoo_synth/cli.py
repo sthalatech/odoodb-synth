@@ -209,7 +209,6 @@ def snapshot(
         None, "--filestore-dir",
         help="Odoo filestore directory (self-hosted pg_dump path only).",
     ),
-    with_parquet: bool = typer.Option(False, "--with-parquet", help="Also export per-table Parquet (needs the [parquet] extra)."),
 ) -> None:
     """Self-hosted path: dump, mask on a scratch DB, and package the result."""
     import os
@@ -285,7 +284,7 @@ def snapshot(
     typer.secho(f"packaging masked DB -> {out_path} ...", fg=typer.colors.CYAN)
     try:
         package.package(PackageConfig(
-            db_url=scratch_url, out=out_path, with_parquet=with_parquet,
+            db_url=scratch_url, out=out_path,
             rulebook_dir=Path(rules),
         ), rb)
     except package.PackageError as exc:

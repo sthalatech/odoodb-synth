@@ -42,7 +42,7 @@ odoo-synth/
       __init__.py
       rulebook.py                  # loads rules/*.yml, validates cross-file consistency (see Validation below)
       mask.py                       # generates SECURITY LABEL statements from the loaded rulebook, calls anon.anonymize_database()
-      package.py                    # produces the output artifact: pg_dump custom-format file (primary) + optional per-table Parquet export via DuckDB (secondary, --with-parquet flag)
+      package.py                    # produces the output artifact: pg_dump custom-format file (primary)
       provision.py                  # fresh Postgres + pg_restore + odoo-bin db load --neutralize, launches Odoo container
   rules/                            # <- the 8 files provided go here
   sql/

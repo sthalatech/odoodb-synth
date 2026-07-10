@@ -38,9 +38,6 @@ result as a restorable backup → provision a fresh instance with
   a self-hosted instance, or a manually downloaded backup zip from
   odoo.sh's Backups tab. See `AGENT_PROMPT.md` for how the two
   adapters differ.
-- **DuckDB** (`pip install duckdb`) — optional, only needed if you
-  want the secondary Parquet export alongside the primary `pg_dump`
-  artifact.
 
 ## Install
 
