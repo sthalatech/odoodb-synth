@@ -84,6 +84,26 @@ odoo-synth ingest --zip backup.zip
 odoo-synth up --from <ingested-bundle-path>
 ```
 
+## Inspecting source provenance (for a full replica)
+
+A running Odoo replica needs more than masked data — it needs the same Odoo
+version, the same installed modules *backed by their addon code*, a compatible
+PostgreSQL major, and a compatible Python. `odoo-synth inspect` detects those
+from a live source (read-only) and reports what a target must provide:
+
+```bash
+odoo-synth inspect \
+  --source-db-url postgresql://user@/prod?host=/var/run/postgresql \
+  --odoo-conf /path/to/odoo.conf \      # resolves addons_path
+  --odoo-bin  /path/to/odoo-bin         # detects Odoo + Python versions
+```
+
+It reports the PostgreSQL/Odoo/Python versions, the installed-module count, and
+— crucially — any **installed module whose code is missing** from `addons_path`
+(a replica blocker: Odoo won't boot without it). `snapshot` runs the same
+detection automatically and writes the result to `provenance.json` inside the
+bundle, so a downstream replica step can verify the target matches the source.
+
 ## Repo layout
 
 | Path | What's there |

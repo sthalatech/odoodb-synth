@@ -192,6 +192,89 @@ def ingest(
     typer.secho(f"OK: ingested into {out_dir}", fg=typer.colors.GREEN)
 
 
+# ---------------------------------------------------------------------------
+# inspect  (detect source provenance -- the non-data layers a replica needs)
+# ---------------------------------------------------------------------------
+
+
+@app.command("inspect")
+def inspect(
+    source_db_url: str = typer.Option(
+        None, "--source-db-url",
+        help="psycopg URL of the SOURCE Odoo DB to inspect (read-only).",
+    ),
+    odoo_conf: str = typer.Option(
+        None, "--odoo-conf",
+        help="Path to the source odoo.conf (to resolve addons_path).",
+    ),
+    addons_path: str = typer.Option(
+        None, "--addons-path",
+        help="Comma-separated addons_path dirs (overrides/augments odoo.conf).",
+    ),
+    odoo_bin: str = typer.Option(
+        None, "--odoo-bin",
+        help="Path to the source odoo-bin (to detect Odoo + Python versions).",
+    ),
+    out: str = typer.Option(
+        None, "--out",
+        help="Write provenance.json here (default: print to stdout only).",
+    ),
+) -> None:
+    """Detect the source deployment's shape (Odoo/PG/Python versions, installed
+    modules, addon code) and report what a replica needs to reproduce it."""
+    import os
+    from .core import provenance
+    src = source_db_url or os.environ.get("SOURCE_DB_URL")
+    if not src:
+        _fail("no source DB URL: pass --source-db-url or set SOURCE_DB_URL")
+        return
+    ap = [s for s in addons_path.split(",")] if addons_path else None
+    try:
+        report = provenance.detect(
+            src, odoo_conf=odoo_conf, addons_path=ap, odoo_bin=odoo_bin,
+        )
+    except provenance.ProvenanceError as exc:
+        _fail(f"inspect failed: {exc}")
+        return
+    _print_provenance(report)
+    if out:
+        out_path = Path(out)
+        if out_path.is_dir():
+            out_path = out_path / "provenance.json"
+        out_path.write_text(report.to_json(), "utf-8")
+        typer.secho(f"OK: provenance written to {out_path}", fg=typer.colors.GREEN)
+
+
+def _print_provenance(report) -> None:
+    """Human-readable provenance summary."""
+    c = typer.colors
+    typer.secho("Source provenance", fg=c.CYAN, bold=True)
+    typer.echo(f"  DB name         : {report.source_db_name}")
+    typer.echo(f"  PostgreSQL      : {report.postgres_version} (major {report.postgres_major})")
+    typer.echo(f"  DB encoding     : {report.db_encoding}")
+    typer.echo(f"  Odoo series     : {report.odoo_series}  (base {report.odoo_base_version})")
+    typer.echo(f"  Odoo-bin        : {report.odoo_bin_version or '(unknown -- pass --odoo-bin)'}")
+    typer.echo(f"  Python          : {report.python_version or '(unknown -- pass --odoo-bin)'}")
+    typer.echo(f"  Installed mods  : {report.installed_module_count}")
+    typer.echo(f"  addons_path     : {len(report.addons_path)} dir(s)")
+    for repo in report.addon_repos:
+        commit = (repo.git_commit or "")[:12] or "(no git)"
+        dirty = " +dirty" if repo.is_dirty else ""
+        typer.echo(f"    - {repo.path}  [{repo.addon_count} addons, {commit}{dirty}]")
+    if report.missing_addons:
+        typer.secho(
+            f"  MISSING code    : {len(report.missing_addons)} installed module(s) "
+            f"have no code on addons_path (replica blocker):",
+            fg=c.RED, bold=True,
+        )
+        typer.secho(f"    {', '.join(report.missing_addons)}", fg=c.RED)
+    elif report.addons_path:
+        typer.secho("  Addon code      : all installed modules resolved on addons_path",
+                    fg=c.GREEN)
+    for w in report.warnings:
+        typer.secho(f"  warning: {w}", fg=c.YELLOW)
+
+
 @app.command("snapshot")
 def snapshot(
     db: str = typer.Option(..., "--db", help="Name of the source Odoo database to snapshot."),
@@ -208,6 +291,16 @@ def snapshot(
     filestore_dir: str = typer.Option(
         None, "--filestore-dir",
         help="Odoo filestore directory (self-hosted pg_dump path only).",
+    ),
+    odoo_conf: str = typer.Option(
+        None, "--odoo-conf",
+        help="Path to the source odoo.conf: records provenance (addons_path, "
+             "installed-module code presence) into the bundle for the replica.",
+    ),
+    odoo_bin: str = typer.Option(
+        None, "--odoo-bin",
+        help="Path to the source odoo-bin: records Odoo + Python versions into "
+             "the bundle's provenance.json.",
     ),
 ) -> None:
     """Self-hosted path: dump, mask on a scratch DB, and package the result."""
@@ -290,6 +383,31 @@ def snapshot(
     except package.PackageError as exc:
         _fail(f"packaging failed: {exc}")
         return
+
+    # 8. Provenance sidecar: record the source's non-data layers (Odoo/PG/
+    #    Python versions, installed modules, addon code presence) so a replica
+    #    can reproduce the environment, not just the data. Detected from the
+    #    SOURCE (never masked), written next to db.dump. Non-fatal: a bundle is
+    #    still usable for `up` without it; it's required for `replica`.
+    from .core import provenance
+    try:
+        prov = provenance.detect(
+            source_url, odoo_conf=odoo_conf, odoo_bin=odoo_bin,
+        )
+        (out_path / "provenance.json").write_text(prov.to_json(), "utf-8")
+        note = ""
+        if prov.missing_addons:
+            note = (f" -- WARNING: {len(prov.missing_addons)} installed module(s) "
+                    f"have no code on addons_path (see provenance.json)")
+        typer.secho(
+            f"provenance: Odoo {prov.odoo_series}, PostgreSQL {prov.postgres_major}, "
+            f"{prov.installed_module_count} installed modules{note}",
+            fg=typer.colors.YELLOW if prov.missing_addons else typer.colors.CYAN,
+        )
+    except provenance.ProvenanceError as exc:
+        # Detection is best-effort; don't fail a good snapshot over it.
+        typer.secho(f"provenance detection skipped: {exc}", fg=typer.colors.YELLOW)
+
     typer.secho(f"OK: snapshot written to {out_path}", fg=typer.colors.GREEN)
 
 
