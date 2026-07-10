@@ -32,6 +32,7 @@ from pathlib import Path
 from typing import Any
 
 from ..adapters import self_hosted
+from . import pgtools
 from .rulebook import Rulebook
 
 
@@ -47,6 +48,12 @@ class ProvisionConfig:
     odoo_bin: str | None = None
     # If True, launch the Odoo container after load (odoo-bin path only).
     launch: bool = True
+    # If set, reset the admin user's password to this value after restore so
+    # the provisioned instance is immediately loginable. The rulebook masks
+    # every login/password, so without this there is no known credential to
+    # get into the fresh instance -- a fixed dev password is exactly what a
+    # neutralized dev copy wants. None = leave passwords as masked.
+    set_admin_password: str | None = None
 
 
 def provision(cfg: ProvisionConfig, rulebook: Rulebook | None = None) -> dict[str, Any]:
@@ -90,7 +97,14 @@ def provision(cfg: ProvisionConfig, rulebook: Rulebook | None = None) -> dict[st
     # 3. Re-verify credential fields.
     verify = _verify_credentials_scrubbed(cfg, rulebook)
 
-    # 4. Launch (optional, odoo-bin path only).
+    # 4. Optionally reset the admin password so the instance is loginable.
+    #    Done AFTER neutralize/verify so it can't be undone by them, and it
+    #    deliberately writes a fresh pbkdf2 hash (never a plaintext value).
+    admin_login = None
+    if cfg.set_admin_password:
+        admin_login = _set_admin_password(cfg, cfg.set_admin_password)
+
+    # 5. Launch (optional, odoo-bin path only).
     launched = False
     if cfg.launch and odoo_bin:
         launched = _launch_odoo(odoo_bin, cfg.db_name)
@@ -101,6 +115,7 @@ def provision(cfg: ProvisionConfig, rulebook: Rulebook | None = None) -> dict[st
         "neutralized": used_neutralize,
         "credential_verification": verify,
         "launched": launched,
+        "admin_login": admin_login,
         "manifest_source": manifest.get("source"),
     }
 
@@ -119,31 +134,28 @@ def _recreate_db(cfg: ProvisionConfig) -> None:
         with conn.cursor() as cur:
             cur.execute(f'DROP DATABASE IF EXISTS "{cfg.db_name}" WITH (FORCE)')
             cur.execute(f'CREATE DATABASE "{cfg.db_name}"')
-
-
-def _pg_restore_binary() -> list[str]:
-    """Resolve the pg_restore command, honoring ODOO_SYNTH_PG_RESTORE (same
-    pattern as core/package.py's ODOO_SYNTH_PG_DUMP). Needed when the host's
-    pg_restore is an older major than the dump (a PG16 pg_restore can't read
-    a PG18 custom-format dump)."""
-    import os
-    import shlex
-    override = os.environ.get("ODOO_SYNTH_PG_RESTORE")
-    if override:
-        return shlex.split(override)
-    return ["pg_restore"]
-
-
-def _restore_db_url(db_url: str) -> str:
-    """DB URL for pg_restore specifically. Honors ODOO_SYNTH_RESTORE_DB_URL
-    so the restore subprocess (possibly in-container) connects to the right
-    socket while psycopg connects from the host."""
-    import os
-    return os.environ.get("ODOO_SYNTH_RESTORE_DB_URL", db_url)
+            # Pin this DB's default search_path to `public`. Postgres's
+            # built-in default is `"$user", public` -- and our own
+            # bootstrap.sql (loaded into every scratch/target DB) creates a
+            # schema literally named odoo_synth. If the connecting role is
+            # ALSO named odoo_synth (true of the bundled docker-compose
+            # scratch stack's default credentials), "$user" resolves to that
+            # schema FIRST. Any client that connects without an explicit
+            # search_path override -- e.g. a real Odoo instance pointed at
+            # this provisioned DB with stock config, which is the whole
+            # point of provisioning it -- then silently reads/writes into
+            # the empty odoo_synth schema instead of the public schema
+            # holding the actual restored-and-masked data. No error, no
+            # warning: Odoo just boots against a blank database and looks
+            # "empty" instead of masked. Found via a real end-to-end test
+            # against darkstore. ALTER DATABASE ... SET makes public always
+            # win regardless of which role connects.
+            cur.execute(
+                f'ALTER DATABASE "{cfg.db_name}" SET search_path TO public'
+            )
 
 
 def _pg_restore(bundle: Path, cfg: ProvisionConfig) -> None:
-    import os
     dump = bundle / "db.dump"
     if not dump.exists():
         raise ProvisionError(
@@ -151,30 +163,32 @@ def _pg_restore(bundle: Path, cfg: ProvisionConfig) -> None:
             "pg_restore fallback needs a custom-format dump (pg_dump -Fc)."
         )
     # Pipe the dump to pg_restore's stdin so it works through `docker exec`
-    # redirects (the dump file is on the host, pg_restore may be in-container).
+    # redirects (the dump file is on the host, pg_restore may run in-container
+    # -- pgtools auto-falls back to the scratch container's own pg_restore on
+    # a major-version mismatch, same as package.py's pg_dump path).
     # Restore into the TARGET DB (not the admin/maintenance DB -- cfg.db_url
     # points at `postgres` so CREATE DATABASE works; the restore must land in
     # cfg.db_name).
     target_url = _target_db_url(cfg.db_url, cfg.db_name)
-    # ODOO_SYNTH_RESTORE_DB_URL override: when the restore binary runs in a
-    # container (host pg_restore too old for the server major), the in-
-    # container DB URL differs from the host URL. The override may contain a
-    # literal {dbname} placeholder substituted with the target DB name, so a
-    # single env var works for any target DB (the target name is dynamic, so a
-    # static URL can't point at it). Without the placeholder the override is
-    # used as-is (back-compat with the existing ODOO_SYNTH_RESTORE_DB_URL form
-    # used elsewhere -- though those callers restore into a fixed DB).
-    override = os.environ.get("ODOO_SYNTH_RESTORE_DB_URL")
-    if override:
-        restore_url = override.replace("{dbname}", cfg.db_name)
-    else:
-        restore_url = target_url
-    proc = subprocess.run(
-        _pg_restore_binary() + ["-d", restore_url,
-                                 "--no-owner", "--no-privileges",
-                                 "--clean", "--if-exists"],
-        stdin=open(dump, "rb"), capture_output=True, text=True,
-    )
+    with open(dump, "rb") as dump_fh:
+        try:
+            proc = pgtools.run_pg_tool(
+                "pg_restore",
+                ["--no-owner", "--no-privileges", "--clean", "--if-exists"],
+                target_url,
+                cmd_env="ODOO_SYNTH_PG_RESTORE",
+                url_envs=("ODOO_SYNTH_RESTORE_DB_URL",),
+                input_file=dump_fh,
+                url_as_flag="-d",
+                dbname=cfg.db_name,
+                # pg_restore --clean --if-exists routinely exits 1 with
+                # benign "errors ignored on restore" notices; we verify
+                # success ourselves below (res_partner/ir_config_parameter
+                # existence), not the return code.
+                tolerate_nonzero_exit=True,
+            )
+        except pgtools.PgToolError as exc:
+            raise ProvisionError(f"pg_restore failed: {exc}") from exc
     # pg_restore --clean emits benign "does not exist" notices on a fresh DB;
     # verify data actually loaded into the TARGET DB (not the admin DB) rather
     # than trusting the return code. Connecting to target_url is the fix for
@@ -351,17 +365,33 @@ def _read_manifest(bundle: Path) -> dict:
     return {}
 
 
+def _with_dbname(db_url: str, db_name: str) -> str:
+    """Return db_url with its path (dbname) component replaced by db_name.
+
+    Uses urllib.parse.urlsplit/urlunsplit rather than naive rsplit("/") --
+    the naive version breaks on any psycopg URL with a query string
+    containing a slash, which is the STANDARD way to point libpq at a
+    non-default Unix socket directory (e.g.
+    ``postgresql://user@/dbname?host=/var/run/postgresql``, exactly the
+    peer-auth form Odoo's own db_host=False config implies and what a
+    default-auth local Postgres setup requires). rsplit("/", 1) on that URL
+    chops the query string instead of the dbname, producing garbage like
+    ``.../var/run/postgresql`` as the "database name" -- a real bug found
+    provisioning against a real (non-docker) Postgres instance.
+    """
+    from urllib.parse import urlsplit, urlunsplit
+    parts = urlsplit(db_url)
+    return urlunsplit((parts.scheme, parts.netloc, f"/{db_name}", parts.query, parts.fragment))
+
+
 def _admin_url(db_url: str, db_name: str) -> str:
-    """Strip the dbname off a psycopg URL to get the maintenance DB URL."""
-    # postgresql://user:pass@host:port/dbname -> .../postgres
-    if "/" in db_url.rsplit("@", 1)[-1]:
-        base = db_url.rsplit("/", 1)[0]
-        return base + "/postgres"
-    return db_url + "/postgres"
+    """Rewrite a psycopg URL to point at the `postgres` maintenance DB."""
+    return _with_dbname(db_url, "postgres")
 
 
 def _target_db_url(db_url: str, db_name: str) -> str:
-    """The URL of the freshly-created target DB (admin URL base + /<db_name>).
+    """The URL of the freshly-created target DB (admin URL, dbname swapped
+    for db_name).
 
     cfg.db_url is the ADMIN URL (points at the maintenance DB so we can
     CREATE DATABASE); the restore, manual-neutralize, and credential-verify
@@ -369,7 +399,56 @@ def _target_db_url(db_url: str, db_name: str) -> str:
     into the admin URL would dump Odoo's tables into the `postgres` DB -- a
     real bug found by the first real-schema provisioning run on darkstore.
     """
-    if "/" in db_url.rsplit("@", 1)[-1]:
-        base = db_url.rsplit("/", 1)[0]
-        return f"{base}/{db_name}"
-    return f"{db_url}/{db_name}"
+    return _with_dbname(db_url, db_name)
+
+
+def _set_admin_password(cfg: ProvisionConfig, password: str) -> str:
+    """Reset the admin user's password on the provisioned DB and return its
+    (masked) login.
+
+    Writes a proper Odoo-compatible pbkdf2-sha512 hash (the same scheme Odoo
+    stores in ``res_users.password``) -- never a plaintext value -- so the
+    instance accepts the password at the login form without Odoo having to
+    re-hash on first use. The admin user is resolved via the stable
+    ``base.user_admin`` xmlid rather than a hardcoded id (id 2 is the common
+    case but not guaranteed), falling back to id 2 only if the xmlid is
+    absent.
+    """
+    try:
+        from passlib.context import CryptContext
+    except ImportError as exc:  # pragma: no cover - dependency is declared
+        raise ProvisionError(
+            "--set-admin-password needs passlib (Odoo's own password hasher). "
+            "Install it: pip install passlib"
+        ) from exc
+
+    ctx = CryptContext(schemes=["pbkdf2_sha512"])
+    hashed = ctx.hash(password)
+
+    import psycopg
+    target_url = _target_db_url(cfg.db_url, cfg.db_name)
+    with psycopg.connect(target_url, autocommit=True) as conn:
+        with conn.cursor() as cur:
+            # Pin to the real data schema regardless of role search_path
+            # (the scratch role and bootstrap.sql share the name odoo_synth,
+            # whose empty schema would otherwise shadow public).
+            cur.execute("SET search_path TO public")
+            cur.execute(
+                "SELECT res_id FROM ir_model_data "
+                "WHERE module = 'base' AND name = 'user_admin' "
+                "AND model = 'res.users'"
+            )
+            row = cur.fetchone()
+            uid = row[0] if row else 2
+            cur.execute(
+                "UPDATE res_users SET password = %s WHERE id = %s",
+                (hashed, uid),
+            )
+            if cur.rowcount != 1:
+                raise ProvisionError(
+                    f"could not set admin password: no res_users row id={uid} "
+                    f"(resolved from base.user_admin xmlid). Restore may be "
+                    f"incomplete."
+                )
+            cur.execute("SELECT login FROM res_users WHERE id = %s", (uid,))
+            return cur.fetchone()[0]

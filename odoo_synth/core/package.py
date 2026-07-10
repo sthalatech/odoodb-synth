@@ -19,12 +19,12 @@ from __future__ import annotations
 
 import hashlib
 import json
-import subprocess
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from . import pgtools
 from .rulebook import Rulebook
 from .schema import snapshot_from_db
 
@@ -115,54 +115,44 @@ def package(cfg: PackageConfig, rulebook: Rulebook | None = None) -> Path:
 
 def _dump_db_url(db_url: str) -> str:
     """DB URL for pg_dump specifically (the masked scratch DB package()
-    dumps). Honors ODOO_SYNTH_PACKAGE_DB_URL for the in-container socket form
-    when pg_dump runs in-container via ODOO_SYNTH_PG_DUMP. Distinct from
-    ODOO_SYNTH_DUMP_DB_URL (which the source-dump in adapters/self_hosted.py
-    uses) because package dumps the *masked scratch*, not the source."""
+    dumps). Honors an explicit ODOO_SYNTH_PACKAGE_DB_URL override for the
+    in-container socket form; pgtools.run_pg_tool's automatic fallback
+    rewrites the URL itself when no explicit override is set, so this is
+    only consulted for the initial (host) attempt."""
     import os
     return os.environ.get("ODOO_SYNTH_PACKAGE_DB_URL", db_url)
 
 
-def _pg_dump_binary() -> list[str]:
-    """Resolve the pg_dump command, honoring ODOO_SYNTH_PG_DUMP.
-
-    Set ODOO_SYNTH_PG_DUMP to a command prefix (e.g.
-    'docker exec odoo-synth-postgres-anon pg_dump') to route pg_dump through
-    a container when the host's pg_dump is a different major version than the
-    DB server (pg_dump cannot dump a newer-server-major DB from an older
-    client). Plain `pg_dump` on PATH is the default.
-    """
-    import os
-    import shlex
-    override = os.environ.get("ODOO_SYNTH_PG_DUMP")
-    if override:
-        return shlex.split(override)
-    return ["pg_dump"]
-
-
 def _pg_dump_custom(db_url: str, out_file: Path) -> None:
     # Pipe to stdout (not -f <path>) so it works through `docker exec`
-    # redirects where -f would be container-relative.
-    proc = subprocess.run(
-        _pg_dump_binary() + ["-Fc", _dump_db_url(db_url)],
-        stdout=open(out_file, "wb"), stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        raise PackageError(
-            f"pg_dump -Fc failed (exit {proc.returncode}): "
-            f"{proc.stderr.decode('utf-8', 'replace')}"
-        )
+    # redirects where -f would be container-relative. pgtools handles the
+    # host/major-version-mismatch -> scratch-container fallback
+    # automatically (see core/pgtools.py); no ODOO_SYNTH_PG_DUMP needed for
+    # the common case of the bundled docker-compose.scratch.yml stack.
+    with open(out_file, "wb") as fh:
+        try:
+            pgtools.run_pg_tool(
+                "pg_dump", ["-Fc"], _dump_db_url(db_url),
+                cmd_env="ODOO_SYNTH_PG_DUMP",
+                url_envs=("ODOO_SYNTH_PACKAGE_DB_URL",),
+                output_file=fh,
+            )
+        except pgtools.PgToolError as exc:
+            raise PackageError(str(exc)) from exc
 
 
 def _schema_hash(db_url: str) -> str:
     """sha256 of a schema-only plain-text dump -- a stable identity of the
     masked DB's structure, independent of row data."""
-    proc = subprocess.run(
-        _pg_dump_binary() + ["--schema-only", "--no-owner", "--no-privileges", _dump_db_url(db_url)],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise PackageError(f"pg_dump --schema-only failed:\n{proc.stderr}")
+    try:
+        proc = pgtools.run_pg_tool(
+            "pg_dump", ["--schema-only", "--no-owner", "--no-privileges"],
+            _dump_db_url(db_url),
+            cmd_env="ODOO_SYNTH_PG_DUMP",
+            url_envs=("ODOO_SYNTH_PACKAGE_DB_URL",),
+        )
+    except pgtools.PgToolError as exc:
+        raise PackageError(f"pg_dump --schema-only failed:\n{exc}") from exc
     return hashlib.sha256(proc.stdout.encode("utf-8")).hexdigest()
 
 

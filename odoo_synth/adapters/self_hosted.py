@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..core import pgtools
 
 
 class SelfHostedError(Exception):
@@ -146,27 +147,29 @@ def _dump_via_odoo_bin(odoo_bin: str, cfg: DumpConfig, out: Path) -> None:
 
 
 def _dump_via_pg_dump(cfg: DumpConfig, out: Path) -> None:
-    """pg_dump -Fd directory format + filestore copy.
+    """pg_dump -Fc single-file dump + filestore copy.
 
     Uses the full connection URL (not the bare db name) so it works against
-    remote/containerized Postgres. The ODOO_SYNTH_PG_DUMP env override (see
-    core/package.py) is honored so a host with an older pg_dump can route
-    through the container.
+    remote/containerized Postgres. This is the SOURCE dump (the Odoo
+    instance being snapshotted), which normally has a pg_dump on the same
+    host and matching major -- but pgtools.run_pg_tool's automatic fallback
+    still applies if not (e.g. a source DB upgraded to a newer major than
+    the host's client tools).
     """
     # Custom-format dump to a single file. We pipe to stdout (rather than
     # -f <path>) so it works through `docker exec` redirects where the -f path
     # would be container-relative. The file lands on the host FS.
     dump_file = out / "db.dump"
-    pg_dump = _pg_dump_binary()
-    proc = subprocess.run(
-        pg_dump + ["-Fc", _dump_db_url(cfg.db_url)],
-        stdout=open(dump_file, "wb"), stderr=subprocess.PIPE,
-    )
-    if proc.returncode != 0:
-        raise SelfHostedError(
-            f"pg_dump failed (exit {proc.returncode}): "
-            f"{proc.stderr.decode('utf-8', 'replace')}"
-        )
+    with open(dump_file, "wb") as fh:
+        try:
+            pgtools.run_pg_tool(
+                "pg_dump", ["-Fc"], _dump_db_url(cfg.db_url),
+                cmd_env="ODOO_SYNTH_PG_DUMP",
+                url_envs=("ODOO_SYNTH_DUMP_DB_URL",),
+                output_file=fh,
+            )
+        except pgtools.PgToolError as exc:
+            raise SelfHostedError(str(exc)) from exc
     if cfg.filestore_dir:
         src = Path(cfg.filestore_dir)
         if src.exists() and src.is_dir():
@@ -248,18 +251,6 @@ def _dump_db_url(cfg_db_url: str) -> str:
     can connect to the in-container socket while psycopg connects from host."""
     import os
     return os.environ.get("ODOO_SYNTH_DUMP_DB_URL", cfg_db_url)
-
-
-def _pg_dump_binary() -> list[str]:
-    """Resolve the pg_dump command, honoring ODOO_SYNTH_PG_DUMP (see
-    core/package.py). Shared so the adapter and the packager use the same
-    override."""
-    import os
-    import shlex
-    override = os.environ.get("ODOO_SYNTH_PG_DUMP")
-    if override:
-        return shlex.split(override)
-    return ["pg_dump"]
 
 
 def _write_manifest(out: Path, fields: dict[str, Any]) -> None:

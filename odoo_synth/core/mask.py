@@ -41,6 +41,7 @@ in place. Two gotchas we handle explicitly:
 
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -957,26 +958,20 @@ def leak_scan(scratch_db_url: str, original_values: list[str]) -> list[str]:
         return found
 
     dump_text: str | None = None
-    pg_dump_err: str | None = None
     try:
         dump_text = _pg_dump_text(scratch_db_url)
-    except MaskError as exc:
-        # Version mismatch (host pg_dump older than server) is the common
-        # case in the scratch-stack setup -- fall back to the SQL scan rather
-        # than failing the leak check outright.
-        if "version" in str(exc).lower() and "mismatch" in str(exc).lower():
-            pg_dump_err = str(exc)
-        else:
-            raise
+    except MaskError:
+        # pg_dump genuinely unreachable (no binary on PATH, no scratch
+        # container running to auto-fallback to) -- SQL scan is weaker
+        # (misses non-public schemas / bytea hex formatting differences) but
+        # container-portable and doesn't require any external tool.
+        dump_text = _sql_scan_text(scratch_db_url)
     if dump_text is None:
-        # pg_dump unavailable or version-incompatible -> SQL fallback.
         dump_text = _sql_scan_text(scratch_db_url)
     if dump_text is None:
         raise MaskError(
-            "leak_scan: could not obtain DB text (pg_dump missing/incompatible "
-            "and SQL fallback failed) -- install a matching pg_dump or set "
-            "ODOO_SYNTH_PG_DUMP to a containerized one. "
-            f"pg_dump error: {pg_dump_err}"
+            "leak_scan: could not obtain DB text via pg_dump or the SQL "
+            "fallback scan -- is the scratch DB reachable?"
         )
     for v in vals:
         if v in dump_text:
@@ -984,39 +979,43 @@ def leak_scan(scratch_db_url: str, original_values: list[str]) -> list[str]:
     return found
 
 
-def _pg_dump_binary() -> list[str]:
-    """Resolve the pg_dump command, honoring ODOO_SYNTH_PG_DUMP (same pattern
-    as core/package.py). The host's pg_dump may be an older major than the
-    DB server (PG16 client can't dump PG18), so the container override is the
-    portable path for the leak scan against the scratch stack."""
-    import os
-    import shlex
-    override = os.environ.get("ODOO_SYNTH_PG_DUMP")
-    if override:
-        return shlex.split(override)
-    return ["pg_dump"]
-
-
 def _pg_dump_text(db_url: str) -> str | None:
-    """Return pg_dump plain-text output, or None if pg_dump isn't available."""
-    import shutil
-    import subprocess
-    import os
-    binary = _pg_dump_binary()
-    # Only check PATH availability for the default (non-overridden) pg_dump.
-    if not os.environ.get("ODOO_SYNTH_PG_DUMP") and shutil.which(binary[0]) is None:
-        return None
-    # When using the container override, the DB URL also needs to be the
-    # in-container form -- honor ODOO_SYNTH_DUMP_DB_URL (the masked scratch DB
-    # is what we're scanning).
+    """Return pg_dump plain-text output via pgtools (handles the host/
+    major-version-mismatch -> scratch-container fallback automatically).
+    Raises MaskError if pg_dump is unreachable even via the container
+    fallback (caller falls back further, to the SQL scan)."""
+    from . import pgtools
     dump_url = os.environ.get("ODOO_SYNTH_DUMP_DB_URL") or os.environ.get(
         "ODOO_SYNTH_PACKAGE_DB_URL") or db_url
-    proc = subprocess.run(
-        binary + ["--no-owner", "--no-privileges", "--schema=public", dump_url],
-        capture_output=True, text=True,
-    )
-    if proc.returncode != 0:
-        raise MaskError(f"pg_dump for leak scan failed: {proc.stderr}")
+    # Two deliberate choices here, both found by running this leak scan for
+    # real against the bootstrap.sql-loaded scratch stack (not just the
+    # small hand-seeded unit-test schema):
+    #
+    #  1. NOT --schema=public: the anon extension's DDL event trigger can
+    #     relocate newly-created tables out of public into the
+    #     anon/odoo_synth schemas (see _sql_scan_text's docstring for the
+    #     same gotcha) -- a public-only dump would silently miss PII sitting
+    #     in a relocated table, which is exactly the false-negative this
+    #     leak scan exists to prevent. Dump every schema.
+    #
+    #  2. --data-only (rather than a full schema+data dump): a full dump
+    #     includes function BODIES (odoo_synth's own bootstrap.sql helper
+    #     functions, e.g. fake_phone_number()'s literal `1000 + floor(...)`),
+    #     and a short generic original value (an ordinary numeric zip code
+    #     like "1000") can then substring-match the tool's own SQL source --
+    #     a false positive that has nothing to do with a real data leak.
+    #     Data-only avoids that whole class of noise while still catching
+    #     every actual row, including ones relocated by the anon extension
+    #     (which is a data-placement quirk, not a schema-only concern).
+    try:
+        proc = pgtools.run_pg_tool(
+            "pg_dump", ["--no-owner", "--no-privileges", "--data-only"],
+            dump_url,
+            cmd_env="ODOO_SYNTH_PG_DUMP",
+            url_envs=("ODOO_SYNTH_DUMP_DB_URL", "ODOO_SYNTH_PACKAGE_DB_URL"),
+        )
+    except pgtools.PgToolError as exc:
+        raise MaskError(f"pg_dump for leak scan failed: {exc}") from exc
     return proc.stdout
 
 

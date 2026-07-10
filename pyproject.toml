@@ -24,6 +24,7 @@ dependencies = [
     "typer>=0.12",
     "psycopg[binary]>=3.1",
     "pyyaml>=6.0",
+    "passlib>=1.7",
 ]
 
 [project.optional-dependencies]

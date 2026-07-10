@@ -24,7 +24,16 @@ result as a restorable backup → provision a fresh instance with
   installed) and an Odoo 19 instance for local testing.
 - **Python 3.11+**
 - **PostgreSQL client tools** (`pg_dump`, `pg_restore`, `psql`)
-  matching your source instance's Postgres major version.
+  matching your source instance's Postgres major version. The bundled
+  `docker-compose.scratch.yml` runs postgres-anon on its own (typically
+  newer) Postgres major, independent of your source instance's -- if your
+  host's `pg_dump`/`pg_restore` can't talk to that container directly
+  (a "server version mismatch" or "unsupported version in file header"
+  error), the CLI automatically retries through the container's own
+  matching binaries via `docker exec` (see `odoo_synth/core/pgtools.py`).
+  No manual `ODOO_SYNTH_PG_DUMP`/`ODOO_SYNTH_PG_RESTORE` env vars are needed
+  for the default `docker-compose.scratch.yml` setup; they remain available
+  as an explicit override for a differently-named/non-default container.
 - **Access to an Odoo v19 backup** — either direct DB/shell access for
   a self-hosted instance, or a manually downloaded backup zip from
   odoo.sh's Backups tab. See `AGENT_PROMPT.md` for how the two

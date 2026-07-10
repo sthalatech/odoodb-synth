@@ -301,6 +301,12 @@ def up(
     db_url: str = typer.Option(None, "--db-url",
         help="psycopg URL to a Postgres where the fresh DB will be created."),
     no_launch: bool = typer.Option(False, "--no-launch", help="Restore + neutralize only, don't start Odoo."),
+    set_admin_password: str = typer.Option(
+        None, "--set-admin-password",
+        help="Reset the admin user's password to this value so the masked "
+             "instance is immediately loginable (logins/passwords are masked, "
+             "so otherwise there's no known credential to get in).",
+    ),
 ) -> None:
     """Provision a fresh Odoo instance from a masked bundle (with --neutralize)."""
     import os
@@ -314,13 +320,18 @@ def up(
         report = provision.provision(ProvisionConfig(
             bundle=Path(from_), db_name=db, db_url=url,
             launch=not no_launch,
+            set_admin_password=set_admin_password,
         ))
     except provision.ProvisionError as exc:
         _fail(f"provision failed: {exc}")
         return
+    login_note = ""
+    if report.get("admin_login"):
+        login_note = f", admin_login={report['admin_login']!r}"
     typer.secho(
         f"OK: provisioned {report['db_name']} (neutralized={report['neutralized']}, "
-        f"launched={report['launched']}, creds_verified={report['credential_verification']['passed']})",
+        f"launched={report['launched']}, creds_verified={report['credential_verification']['passed']}"
+        f"{login_note})",
         fg=typer.colors.GREEN,
     )
 
@@ -358,25 +369,41 @@ def _restore_into_scratch(bundle: Path, scratch_url: str, db_name: str) -> None:
                 "EXECUTE format('DROP TABLE IF EXISTS %I CASCADE', r.relname); "
                 "END LOOP; END $$;"
             )
-    # Custom-format dump (db.dump) -> pg_restore. Plain SQL (dump.sql, from
-    # the odoo-bin path) -> psql directly.
-    import subprocess
+    # Custom-format dump (db.dump) -> pg_restore (via pgtools, which
+    # auto-falls back to the scratch container's own pg_restore on a
+    # major-version mismatch -- see core/pgtools.py). Plain SQL (dump.sql,
+    # from the odoo-bin path) -> psql directly.
+    from .core import pgtools
+    import os
     dump = bundle / "db.dump"
     if dump.exists():
-        # pg_restore pipes the dump file to pg_restore's stdin so it works
-        # through `docker exec` (ODOO_SYNTH_PG_RESTORE override) too.
-        restore = _pg_restore_binary()
-        # The restore subprocess may run in-container (ODOO_SYNTH_PG_RESTORE);
-        # honor ODOO_SYNTH_RESTORE_DB_URL for the in-container socket form
-        # (separate from ODOO_SYNTH_DUMP_DB_URL because dump targets the
-        # source and restore targets the scratch -- different DBs).
-        import os
+        # The restore subprocess may run in-container (auto or via the
+        # explicit ODOO_SYNTH_PG_RESTORE override); honor
+        # ODOO_SYNTH_RESTORE_DB_URL for the in-container socket form when set
+        # explicitly (separate from ODOO_SYNTH_DUMP_DB_URL because dump
+        # targets the source and restore targets the scratch -- different
+        # DBs).
         restore_url = os.environ.get("ODOO_SYNTH_RESTORE_DB_URL", scratch_url)
-        proc = subprocess.run(
-            restore + ["-d", restore_url, "--no-owner", "--no-privileges",
-                        "--clean", "--if-exists"],
-            stdin=open(dump, "rb"), capture_output=True, text=True,
-        )
+        with open(dump, "rb") as dump_fh:
+            try:
+                proc = pgtools.run_pg_tool(
+                    "pg_restore",
+                    ["--no-owner", "--no-privileges", "--clean", "--if-exists"],
+                    restore_url,
+                    cmd_env="ODOO_SYNTH_PG_RESTORE",
+                    url_envs=("ODOO_SYNTH_RESTORE_DB_URL",),
+                    input_file=dump_fh,
+                    url_as_flag="-d",
+                    # pg_restore --clean --if-exists routinely exits 1 with
+                    # benign "errors ignored on restore" notices (e.g. DROP
+                    # EXTENSION on an object something else still depends on);
+                    # we verify success ourselves below (res_partner exists),
+                    # not the return code -- matches the pre-existing
+                    # behavior this module replaced.
+                    tolerate_nonzero_exit=True,
+                )
+            except pgtools.PgToolError as exc:
+                raise RuntimeError(f"pg_restore into scratch failed: {exc}") from exc
         # Verify the restore actually loaded data -- pg_restore --clean emits
         # benign "does not exist" notices on a fresh DB, so return-code alone
         # is misleading. We check res_partner exists in the scratch DB; if not,
@@ -400,17 +427,6 @@ def _restore_into_scratch(bundle: Path, scratch_url: str, db_name: str) -> None:
     raise RuntimeError(f"bundle {bundle} has no db.dump or dump.sql to restore")
 
 
-
-
-def _pg_restore_binary() -> list[str]:
-    """Resolve the pg_restore command, honoring ODOO_SYNTH_PG_RESTORE
-    (see core/package.py's ODOO_SYNTH_PG_DUMP for the same pattern)."""
-    import os
-    import shlex
-    override = os.environ.get("ODOO_SYNTH_PG_RESTORE")
-    if override:
-        return shlex.split(override)
-    return ["pg_restore"]
 
 
 def _load_bootstrap(scratch_url: str) -> None:
