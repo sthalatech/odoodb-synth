@@ -453,6 +453,60 @@ def up(
     )
 
 
+# ---------------------------------------------------------------------------
+# replica  (generate a portable native replica kit from a masked bundle)
+# ---------------------------------------------------------------------------
+
+
+@app.command("replica")
+def replica(
+    from_: str = typer.Option(..., "--from", help="Path to a masked bundle (must contain provenance.json)."),
+    out: str = typer.Option(..., "--out", help="Directory to write the generated replica kit into."),
+    # Target Odoo runtime.
+    addons_path: str = typer.Option(
+        "/opt/odoo/odoo/addons", "--addons-path",
+        help="Colon-separated addons_path on the TARGET (preflight verifies module code here)."),
+    odoo_bin: str = typer.Option("/opt/odoo/odoo/odoo-bin", "--odoo-bin", help="Path to odoo-bin on the target."),
+    python_bin: str = typer.Option("python3", "--python", help="Python interpreter on the target."),
+    # Target PostgreSQL.
+    db_host: str = typer.Option("", "--db-host", help="Target PG host (empty => local socket / peer auth)."),
+    db_port: int = typer.Option(5432, "--db-port", help="Target PG port."),
+    db_user: str = typer.Option("odoo", "--db-user", help="Target PG role."),
+    db_password: str = typer.Option("", "--db-password", help="Target PG password (empty => socket/.pgpass)."),
+    db_name: str = typer.Option("odoo", "--db-name", help="Name for the replica DB on the target."),
+    # Target Odoo service.
+    data_dir: str = typer.Option("/var/lib/odoo", "--data-dir", help="Odoo data_dir on the target."),
+    http_port: int = typer.Option(8069, "--http-port", help="HTTP port for the replica."),
+    admin_password: str = typer.Option("admin", "--admin-password", help="Admin login password to set post-restore."),
+    master_password: str = typer.Option("", "--master-password", help="odoo.conf admin_passwd (DB-management master)."),
+    service_name: str = typer.Option("odoo", "--service-name", help="systemd service name."),
+    service_user: str = typer.Option("odoo", "--service-user", help="System user the service runs as."),
+    allow_mismatch: bool = typer.Option(
+        False, "--allow-mismatch",
+        help="Downgrade PG-major / Odoo-series skew from hard-fail to warning "
+             "in preflight. Missing addon code stays a hard failure."),
+) -> None:
+    """Generate a portable native replica kit (preflight + install scripts,
+    odoo.conf, systemd unit) from a masked bundle, ready to run on a target."""
+    from .core import replica as replica_mod
+    from .core.replica import ReplicaConfig
+    cfg = ReplicaConfig(
+        addons_path=addons_path, odoo_bin=odoo_bin, python_bin=python_bin,
+        db_host=db_host, db_port=db_port, db_user=db_user,
+        db_password=db_password, db_name=db_name,
+        data_dir=data_dir, http_port=http_port,
+        admin_password=admin_password, master_password=master_password,
+        service_name=service_name, service_user=service_user,
+        allow_mismatch=allow_mismatch,
+    )
+    try:
+        kit = replica_mod.generate_kit(Path(from_), Path(out), cfg)
+    except replica_mod.ReplicaError as exc:
+        _fail(f"replica generation failed: {exc}")
+        return
+    typer.secho(f"OK: replica kit written to {kit}", fg=typer.colors.GREEN)
+    typer.echo("  Next: copy the bundle's db.dump (and filestore/) beside the kit, then on the target run:")
+    typer.echo(f"    ./preflight.sh   &&   sudo ./install.sh")
 
 
 # ---------------------------------------------------------------------------
